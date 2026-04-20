@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "School Homework Absence Setter",
+  "version": "1.0",
+  "description": "Extension to set homework absences for school groups",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://school.mos.ru/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Set Homework Absences"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://school.mos.ru/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
