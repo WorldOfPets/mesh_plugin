@@ -1,8 +1,9 @@
-function getCookie(name) {
-  const value = `; ${document.cookie}`;
-  const parts = value.split(`; ${name}=`);
-  if (parts.length === 2) return parts.pop().split(';').shift();
-  return null;
+function sendLog(message) {
+  chrome.runtime.sendMessage({ type: 'log', message: message });
+}
+
+function sendError(message) {
+  chrome.runtime.sendMessage({ type: 'error', message: message });
 }
 
 const BASE_URL = "https://school.mos.ru/api";
@@ -40,14 +41,14 @@ async function setHomeworkAbsences(groupId, absenceDate) {
       body: JSON.stringify(payload)
     });
     if (response.ok) {
-      console.log(`✅ Absence set for group ${groupId} on ${absenceDate}`);
+      sendLog(`✅ Absence set for group ${groupId} on ${absenceDate}`);
       return await response.json();
     } else {
-      console.error(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
+      sendError(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
       return { error: response.statusText, status: response.status };
     }
   } catch (e) {
-    console.error(`❌ Request failed: ${e}`);
+    sendError(`❌ Request failed: ${e}`);
     return { error: e.message };
   }
 }
@@ -61,11 +62,11 @@ async function getGroups() {
       const data = await response.json();
       return data.assigned_group_ids || [];
     } else {
-      console.error('Failed to get groups');
+      sendError('Failed to get groups');
       return [];
     }
   } catch (e) {
-    console.error(`Error fetching groups: ${e}`);
+    sendError(`Error fetching groups: ${e}`);
     return [];
   }
 }
@@ -117,17 +118,17 @@ async function main() {
   if (!token || !teacherId || !aid || !subsystemId) {
     throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
   }
-  console.log('Starting to set homework absences...');
+  sendLog('Starting to set homework absences...');
   const groups = await getGroups();
-  console.log('Groups:', groups);
+  sendLog('Groups: ' + JSON.stringify(groups));
 
   const period = getCurrentAcademicPeriod();
 
     if (period) {
-        console.log(`📅 Обработка периода: ${period.startMonth}-${period.endMonth} / ${period.year}`);
+        sendLog(`📅 Обработка периода: ${period.startMonth}-${period.endMonth} / ${period.year}`);
         
         for (const group of groups) {
-            console.log(`👥 Группа: ${group}`);
+            sendLog(`👥 Группа: ${group}`);
             
             for (let month = period.startMonth; month <= period.endMonth; month++) {
             const daysInMonth = getDaysInMonth(period.year, month);
@@ -142,7 +143,7 @@ async function main() {
                 // Небольшая задержка, чтобы не перегружать сервер
                 await new Promise(resolve => setTimeout(resolve, 100));
                 } catch (error) {
-                console.error(`❌ Ошибка для ${absenceDate}:`, error.message);
+                sendError(`❌ Ошибка для ${absenceDate}: ${error.message}`);
                 }
             }
             }
@@ -167,11 +168,11 @@ async function calendarPlans(journal, finistOrRecalc = 'finish') {
       headers,
     });
     
-    console.log(response); // Как в оригинале
+    sendLog('Calendar plans response: ' + response.status);
     return response;
     
   } catch (error) {
-    console.error(`❌ Ошибка в calendarPlans(${journal}):`, error.message);
+    sendError(`❌ Ошибка в calendarPlans(${journal}): ${error.message}`);
   }
 }
 
@@ -200,12 +201,12 @@ async function getAcademicYear(groups) {
     const arrCalendars = await response.json();
     const arrCalIds = arrCalendars.map(cal => cal.id);
     
-    console.log(arrCalIds);
+    sendLog('Calendar IDs: ' + JSON.stringify(arrCalIds));
     return arrCalIds;
     
   } catch (error) {
-    console.error('❌ Ошибка при получении календарных планов:', error.message);
-    console.log(error); // Пробрасываем ошибку выше для обработки
+    sendError('❌ Ошибка при получении календарных планов: ' + error.message);
+    throw error; // Пробрасываем ошибку выше для обработки
   }
 }
 
@@ -213,20 +214,20 @@ async function syncKTP() {
   if (!token || !teacherId || !aid || !subsystemId) {
     throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
   }
-  console.log('Starting to set homework absences...');
+  sendLog('Starting to set homework absences...');
   const groups = await getGroups();
-  console.log('Groups:', groups);
+  sendLog('Groups: ' + JSON.stringify(groups));
 
   const academPlans = await getAcademicYear(groups);
-  console.log(`📋 Найдено календарей: ${academPlans.length}`);
+  sendLog(`📋 Найдено календарей: ${academPlans.length}`);
   for(const calc of academPlans){
     try{
         await calendarPlans(calc);
         await new Promise(resolve => setTimeout(resolve, 1000));
         await calendarPlans(calc, 'recalc');
-        console.log(`✅ Календарь ${calc} обработан успешно`);
+        sendLog(`✅ Календарь ${calc} обработан успешно`);
     }catch(error){
-        console.error(`❌ Ошибка при синхронизации KTP для календарного плана ${calc}:`, error.message);
+        sendError(`❌ Ошибка при синхронизации KTP для календарного плана ${calc}: ${error.message}`);
     }
 
   }
@@ -234,27 +235,27 @@ async function syncKTP() {
 }
 
 // Listen for messages from popup
-console.log('Content script loaded on school.mos.ru');
+sendLog('Content script loaded on school.mos.ru');
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log('Message received:', request);
+  sendLog('Message received: ' + JSON.stringify(request));
   if (request.action === 'setAbsences') {
     main().then(() => {
-      console.log('Process completed successfully');
+      sendLog('Process completed successfully');
       sendResponse({ success: true });
     }).catch(error => {
-      console.error('Error in main:', error);
+      sendError('Error in main: ' + error.message);
       sendResponse({ success: false, error: error.message });
     });
     return true; // Keep the message channel open for async response
   }else if (request.action === 'syncKTP') {
   
     // Placeholder for KTP sync logic
-    console.log('KTP sync action received');
+    sendLog('KTP sync action received');
     syncKTP().then(() => {
-      console.log('KTP sync completed successfully');
+      sendLog('KTP sync completed successfully');
       sendResponse({ success: true });
     }).catch(error => {
-      console.error('Error in syncKTP:', error);
+      sendError('Error in syncKTP: ' + error.message);
       sendResponse({ success: false, error: error.message });
     });
     return true; // Keep the message channel open for async response
