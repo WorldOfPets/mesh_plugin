@@ -5,6 +5,15 @@ function getCookie(name) {
   return null;
 }
 
+
+function sendLog(message) {
+  chrome.runtime.sendMessage({ type: 'log', message: message });
+}
+
+function sendError(message) {
+  chrome.runtime.sendMessage({ type: 'error', message: message });
+}
+
 const BASE_URL = "https://school.mos.ru/api";
 const token = getCookie('aupd_token');
 const teacherId = getCookie('profile_id');
@@ -40,32 +49,36 @@ async function setHomeworkAbsences(groupId, absenceDate) {
       body: JSON.stringify(payload)
     });
     if (response.ok) {
-      console.log(`✅ Absence set for group ${groupId} on ${absenceDate}`);
+      sendLog(`✅ Absence set for group ${groupId} on ${absenceDate}`);
       return await response.json();
     } else {
-      console.error(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
+      //sendError(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
       return { error: response.statusText, status: response.status };
     }
   } catch (e) {
-    console.error(`❌ Request failed: ${e}`);
+    //sendError(`❌ Request failed: ${e}`);
     return { error: e.message };
   }
 }
 
 async function getGroups() {
   const url = `${BASE_URL}/profeducation/core/teacher/v1/teacher_profiles/${teacherId}?with_assigned_groups=true&with_replacement_groups=true`;
-  const headers = { ...HEADERS, };
+  const headers = { ...HEADERS};
   try {
-    const response = await fetch(url, { headers });
+    const response = await fetch(url, { 
+      method: 'GET',
+      headers,
+      credentials: 'include'
+    });
     if (response.ok) {
       const data = await response.json();
       return data.assigned_group_ids || [];
     } else {
-      console.error('Failed to get groups');
+      sendError('Failed to get groups');
       return [];
     }
   } catch (e) {
-    console.error(`Error fetching groups: ${e}`);
+    sendError(`Error fetching groups: ${e}`);
     return [];
   }
 }
@@ -115,19 +128,21 @@ function getDaysInMonth(year, month) {
 
 async function main() {
   if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
+    throw new Error('Перезайдите в учетную запись МЭШ.');
   }
-  console.log('Starting to set homework absences...');
+  sendLog('Starting to set homework absences...');
   const groups = await getGroups();
-  console.log('Groups:', groups);
+  sendLog('Groups: ' + JSON.stringify(groups));
 
   const period = getCurrentAcademicPeriod();
 
     if (period) {
-        console.log(`📅 Обработка периода: ${period.startMonth}-${period.endMonth} / ${period.year}`);
-        
+        sendLog(`📅 Обработка периода: ${period.startMonth}-${period.endMonth} / ${period.year}`);
+        let current = 0;
+        const total = groups.length * (period.endMonth - period.startMonth + 1) * 31; // Максимум 31 день в месяце
+        sendProgress(0);
         for (const group of groups) {
-            console.log(`👥 Группа: ${group}`);
+            sendLog(`👥 Группа: ${group}`);
             
             for (let month = period.startMonth; month <= period.endMonth; month++) {
             const daysInMonth = getDaysInMonth(period.year, month);
@@ -141,13 +156,18 @@ async function main() {
                 await setHomeworkAbsences(group, absenceDate);
                 // Небольшая задержка, чтобы не перегружать сервер
                 await new Promise(resolve => setTimeout(resolve, 100));
+                  current++;
+                  sendProgress((current / total) * 100);
                 } catch (error) {
-                console.error(`❌ Ошибка для ${absenceDate}:`, error.message);
+                  current++;
+                  sendProgress((current / total) * 100);
+                //sendError(`❌ Ошибка для ${absenceDate}: ${error.message}`);
                 }
             }
             }
         }
     }
+    sendProgress(100);
 }
 
 /**
@@ -167,11 +187,11 @@ async function calendarPlans(journal, finistOrRecalc = 'finish') {
       headers,
     });
     
-    console.log(response); // Как в оригинале
+    sendLog('Calendar plans response: ' + response.status);
     return response;
     
   } catch (error) {
-    console.error(`❌ Ошибка в calendarPlans(${journal}):`, error.message);
+    sendError(`❌ Ошибка в calendarPlans(${journal}): ${error.message}`);
   }
 }
 
@@ -200,63 +220,355 @@ async function getAcademicYear(groups) {
     const arrCalendars = await response.json();
     const arrCalIds = arrCalendars.map(cal => cal.id);
     
-    console.log(arrCalIds);
+    sendLog('Calendar IDs: ' + JSON.stringify(arrCalIds));
     return arrCalIds;
     
   } catch (error) {
-    console.error('❌ Ошибка при получении календарных планов:', error.message);
-    console.log(error); // Пробрасываем ошибку выше для обработки
+    sendError('❌ Ошибка при получении календарных планов: ' + error.message);
+    throw error; // Пробрасываем ошибку выше для обработки
   }
 }
 
 async function syncKTP() {
   if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
+    throw new Error('Перезайдите в учетную запись МЭШ.');
   }
-  console.log('Starting to set homework absences...');
+  sendLog('Starting to set homework absences...');
   const groups = await getGroups();
-  console.log('Groups:', groups);
+  sendLog('Groups: ' + JSON.stringify(groups));
 
   const academPlans = await getAcademicYear(groups);
-  console.log(`📋 Найдено календарей: ${academPlans.length}`);
+  sendLog(`📋 Найдено календарей: ${academPlans.length}`);
+  let current = 0;
+  const total = academPlans.length;
+  sendProgress(0);
   for(const calc of academPlans){
     try{
         await calendarPlans(calc);
         await new Promise(resolve => setTimeout(resolve, 1000));
         await calendarPlans(calc, 'recalc');
-        console.log(`✅ Календарь ${calc} обработан успешно`);
+        current++;
+        sendProgress((current / total) * 100  );
+        sendLog(`✅ Календарь ${calc} обработан успешно`);
     }catch(error){
-        console.error(`❌ Ошибка при синхронизации KTP для календарного плана ${calc}:`, error.message);
+      current++;
+      sendProgress((current / total) * 100);
+        sendError(`❌ Ошибка при синхронизации KTP для календарного плана ${calc}: ${error.message}`);
     }
 
+  }
+  sendProgress(100);
+
+}
+
+async function selectGroups() {
+  const groups = await getGroups();
+  const groupsStr = groups.map(String).join(',');
+  const url = BASE_URL + '/profeducation/plan/teacher/v1/groups' +
+    '?academic_year_id=' + aid +
+    '&group_ids=' + groupsStr +
+    '&with_periods_schedule_id=true' +
+    '&with_parallel_curriculum_id=true' +
+    '&with_lesson_plans_info=true';
+  const headers = { ...HEADERS};
+  try {
+    const response = await fetch(url, { 
+      method: 'GET',
+      headers, 
+      credentials: 'include'
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    const subjects = await response.json();
+
+    return subjects;
+    
+  } catch (error) {
+    sendError('Ошибка: ' + error.message);
+    throw error; // Пробрасываем ошибку выше для обработки
+  }
+}
+
+let _CONTROL_FORM_ID = null;
+let _GRADE_SYSTEM_ID = null;
+let _COURSE_LESSON_TOPIC_ID = null;
+async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_ids) {
+  try {
+    const period = getCurrentAcademicPeriod();
+    dateFrom = period ? `${period.startDay.toString().padStart(2, '0')}.${period.startMonth.toString().padStart(2, '0')}.${period.year}` : null;
+    dateTo = period ? `${period.endDay.toString().padStart(2, '0')}.${period.endMonth.toString().padStart(2, '0')}.${period.year}` : null;
+    const urlmarks = `${BASE_URL}/profeducation/core/teacher/v1/marks?` +
+      `group_ids=${group_id}&` +
+      `subject_id=${subject_id}&` +
+      
+      `created_at_from=${dateFrom}&` +
+      `created_at_to=${dateTo}&` 
+    const response = await fetch(urlmarks, {
+      method: 'GET',
+      headers: {
+        ...HEADERS,
+      },
+      credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    const data = await response.json();
+    const obj = data[0]; // Берём первый элемент массива, как в оригинале
+
+    
+    _CONTROL_FORM_ID = obj.control_form_id;
+    _GRADE_SYSTEM_ID = obj.grade_system_id;
+    const courselevelvalue = obj.course_lesson_topic_id;
+    _COURSE_LESSON_TOPIC_ID = (courselevelvalue !== "null" && courselevelvalue != null) 
+      ? courselevelvalue 
+      : null;
+    const averageMarks = await getAverageMarks(group_id, subject_id, student_ids);
+    const lessonsIds = await getLessons(group_id, subject_id);
+
+    return {
+      controlFormId: _CONTROL_FORM_ID,
+      gradeSystemId: _GRADE_SYSTEM_ID,
+      courseLessonTopicId: _COURSE_LESSON_TOPIC_ID,
+      averageMarks: averageMarks,
+      lessonsIds: lessonsIds
+    };
+  }catch(error){
+    sendError('Error in setMark: ' + error.message);
+    throw error; 
   }
 
 }
 
+async function getLessons(group_id, subject_id){
+  const period = getCurrentAcademicPeriod();
+  dateFrom = period ? `${period.year}-${period.startMonth.toString().padStart(2, '0')}-${period.startDay.toString().padStart(2, '0')}` : null;
+  dateTo = period ? `${period.year}-${period.endMonth.toString().padStart(2, '0')}-${period.endDay.toString().padStart(2, '0')}` : null;
+  const url = `${BASE_URL}/profeducation/plan/teacher/v1/schedule_items?` +
+      `academic_year_id=${aid}&` +
+      `group_ids=${group_id}&` +
+      `subject_id=${subject_id}&` +
+      `teacher_id=${teacherId}&` +
+      `from=${dateFrom}&` +
+      `to=${dateTo}&` +
+      `with_group_class_subject_info=true&` +
+      `with_course_calendar_info=true&` +
+      `with_lesson_info=true&` +
+      `with_rooms_info=true&` +
+      `with_availability_info=true&`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {...HEADERS},
+
+  });
+  if (!response.ok) {
+    console.error(`❌ Error getting lessons: HTTP ${response.status} ${response.statusText}`);
+    return [];
+  }
+  const data = await response.json();
+  const lessonIds = [];
+    
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        // 🔸 Фильтрация по subject_id (если нужно — раскомментируйте)
+        // if (subject_id && item.subject_id !== subject_id) continue;
+        
+        const lessonId = item.id; // schedule_item_id
+        if (lessonId != null) { // Проверка на null/undefined
+          lessonIds.push(Number(lessonId));
+        }
+      }
+    }
+
+    console.log(`📚 Получено ${lessonIds.length} уроков:`, lessonIds);
+    return lessonIds;
+}
+
+async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 3) {
+  try{
+    const url = `${BASE_URL}/profeducation/core/teacher/v1/average_marks_year?group_ids=${group_id}&student_profile_ids=${student_ids}&subject_id=${subject_id}`;
+    const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          ...HEADERS,
+        },
+        credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
+      });
+    const allStudentIds = student_ids
+        .split(',')
+        .map(id => id.trim())
+        .filter(id => id)
+        .map(id => Number(id));
+    const data = await response.json();
+    const marksMap = new Map();
+      if (Array.isArray(data)) {
+        const markField = `average_mark_five`;
+        for (const item of data) {
+          marksMap.set(item.student_id, {
+            average_mark: Number(item[markField] ?? defaultMark),
+            has_mark: true
+          });
+        }
+      }
+    const result = allStudentIds.map(id => {
+        const markData = marksMap.get(id);
+        return {
+          student_id: id,
+          average_mark: markData ? markData.average_mark : defaultMark,
+          has_mark: markData ? markData.has_mark : false
+        };
+      });
+    return result;
+  }catch(error){
+    sendError('Error in getAverageMarks: ' + error.message);
+    throw error; 
+  }
+  
+}
+function randomizeMark(mark) {
+  if (mark === 5) return Math.random() < 0.2 ? 4 : 5;
+  if (Math.random() >= 0.2) return mark;
+  
+  const delta = Math.random() < 0.5 ? -1 : 1;
+  const candidate = mark + delta;
+  return (candidate >= 1 && candidate <= 5) ? candidate : mark;
+}
+
+function sendProgress(value) {
+  chrome.runtime.sendMessage({ type: 'progress', value: value });
+}
+
+async function setMarks(students_marks, lessons, control_form_id, grade_system_id, course_lesson_topic_id){
+  const results = {
+    success: [],  // Успешные запросы
+    errors: []    // Ошибки с деталями
+  };
+  const total = lessons.length * students_marks.length;
+  let current = 0;
+  sendProgress(0); // Начальный прогресс
+  for(const lesson of lessons){
+    for(const stMark of students_marks){
+      try{
+        const url = `${BASE_URL}/profeducation/core/teacher/v1/marks`;
+        const payload = {
+          comment: "",
+          is_exam: false,
+          is_criterion: false,
+          is_point: false,
+          point_date: "",
+          schedule_lesson_id: lesson,
+          student_profile_id: stMark.student_id,
+          teacher_id: teacherId,           // Глобальная константа
+          control_form_id: control_form_id, // Глобальная переменная
+          weight: 1,
+          theme_frame_integration_id: null,  // Python None → JS null
+          course_lesson_topic_id: course_lesson_topic_id,
+          grade_origins: [
+            {
+              grade_origin: String(randomizeMark(stMark.average_mark)), // Гарантируем строку, как в Python str()
+              grade_system_id: grade_system_id
+            }
+          ],
+          grade_system_type: false
+        };
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { ...HEADERS},
+          body: JSON.stringify(payload), // Аналог json.dumps()
+          credentials: 'include'         // Отправка cookies сессии
+        });
+        current++;
+        sendProgress((current / total) * 100);
+        if (!response.ok) {
+          // 🔸 Логируем, но НЕ прерываем выполнение
+          const errorInfo = {
+            lesson,
+            student_id: stMark.student_id,
+            status: response.status,
+            statusText: response.statusText
+          };
+          
+          console.warn(`⚠️ HTTP ${response.status}: урок ${lesson}, студент ${stMark.student_id}`);
+          results.errors.push(errorInfo);
+          
+          continue; // ➡️ Переходим к следующей итерации цикла
+        }
+        const result = await response.json();
+        //return result;
+        results.success.push({
+          lesson,
+          student_id: stMark.student_id,
+          average_mark: stMark.average_mark,
+          response: result
+        });
+      }catch(error){
+        current++;
+        sendProgress((current / total) * 100);
+        sendError('Error in setMarks: ' + error.message);
+        results.errors.push({
+          lesson,
+          student_id: stMark.student_id,
+          error: error.message,
+          type: 'network_or_parse_error'
+        });
+      }
+      
+    }
+  }
+  sendProgress(100); // Завершающий прогресс
+  return results;
+}
 // Listen for messages from popup
-console.log('Content script loaded on school.mos.ru');
+sendLog('Content script loaded on school.mos.ru');
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log('Message received:', request);
+  sendLog('Message received: ' + JSON.stringify(request));
   if (request.action === 'setAbsences') {
     main().then(() => {
-      console.log('Process completed successfully');
+      sendLog('Process completed successfully');
       sendResponse({ success: true });
     }).catch(error => {
-      console.error('Error in main:', error);
+      sendError('Error in main: ' + error.message);
       sendResponse({ success: false, error: error.message });
     });
     return true; // Keep the message channel open for async response
   }else if (request.action === 'syncKTP') {
   
     // Placeholder for KTP sync logic
-    console.log('KTP sync action received');
+    sendLog('KTP sync action received');
     syncKTP().then(() => {
-      console.log('KTP sync completed successfully');
+      sendLog('KTP sync completed successfully');
       sendResponse({ success: true });
     }).catch(error => {
-      console.error('Error in syncKTP:', error);
+      sendError('Error in syncKTP: ' + error.message);
       sendResponse({ success: false, error: error.message });
     });
     return true; // Keep the message channel open for async response
+  } else if (request.action === "getGroups"){
+    selectGroups().then(groups => { 
+      sendResponse({ success: true, groups: groups });
+    }).catch(error => {
+      sendError('Error in getGroups: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true; // Keep the message channel open for async response
+  } else if (request.action === "setDefaultForMarks"){
+    setDefaultForMarks(request.group_id, request.subject_id, request.class_level_id, request.student_ids).then(result => {
+      sendResponse({ success: true, result: result });
+    }).catch(error => {
+      sendError('Error in setDefaultForMarks: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true; // Keep the message channel open for async response
+  } else if (request.action === "setMarks"){
+    setMarks(request.students_marks, request.lessons, request.control_form_id, request.grade_system_id, request.course_lesson_topic_id).then(result => {
+      sendResponse({ success: true, result: result });
+    }).catch(error => {
+      sendError('Error in setDefaultForMarks: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    })
   }
 });
