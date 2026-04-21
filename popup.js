@@ -11,7 +11,7 @@ document.getElementById('startBtn').addEventListener('click', () => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'setAbsences' }, (response) => {
         if (chrome.runtime.lastError) {
           console.error('Runtime error:', chrome.runtime.lastError);
-          statusDiv.textContent = 'Error: ' + chrome.runtime.lastError.message + '. Try reloading the page.';
+          statusDiv.textContent = 'Перезагрузите страницу.';
           return;
         }
         responded = true;
@@ -26,11 +26,11 @@ document.getElementById('startBtn').addEventListener('click', () => {
       setTimeout(() => {
         if (!responded) {
           console.log('No response within timeout');
-          statusDiv.textContent = 'Error: Timeout - no response from content script';
+          statusDiv.textContent = 'Warning: Timeout - no response from content script';
         }
-      }, 10000);
+      }, 100000);
     } else {
-      statusDiv.textContent = 'Please navigate to school.mos.ru first.';
+      statusDiv.textContent = 'Перейдите в МЭШ.';
     }
   });
 });
@@ -80,6 +80,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.type === 'error') {
     const statusDiv = document.getElementById('status');
     statusDiv.textContent += '\nError: ' + message.message;
+  } else if (message.type === 'progress') {
+    const progressBar = document.getElementById('progressBar');
+    progressBar.value = message.value;
+    progressBar.textContent = message.value + '%';
   }
 });
 let STUDENTS_MARKS = [];
@@ -104,7 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'getGroups' }, (response) => {
         if (chrome.runtime.lastError) {
           console.error('Runtime error:', chrome.runtime.lastError);
-          statusDiv.textContent = 'Error: ' + chrome.runtime.lastError.message + '. Try reloading the page.';
+          statusDiv.textContent = 'Перезагрузите страницу.';
           return;
         }
         responded = true;
@@ -135,11 +139,11 @@ document.addEventListener('DOMContentLoaded', () => {
       setTimeout(() => {
         if (!responded) {
           console.log('No response within timeout');
-          statusDiv.textContent = 'Error: Timeout - no response from content script';
+          statusDiv.textContent = 'Warning: Timeout - no response from content script';
         }
       }, 10000);
     } else {
-      statusDiv.textContent = 'Please navigate to school.mos.ru first.';
+      statusDiv.textContent = 'Перейдите в МЭШ.';
     }
   });
   // Пример получения subject_id при выборе:
@@ -159,7 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'setDefaultForMarks', group_id: GROUP_ID, subject_id: SUBJECT_ID, class_level_id: classLevelId, student_ids: studentIds }, (response) => {
         if (chrome.runtime.lastError) {
           console.error('Runtime error:', chrome.runtime.lastError);
-          statusDiv.textContent = 'Error: ' + chrome.runtime.lastError.message + '. Try reloading the page.';
+          statusDiv.textContent = 'Перезагрузите страницу.';
           
           return;
         }
@@ -187,11 +191,11 @@ document.addEventListener('DOMContentLoaded', () => {
       setTimeout(() => {
         if (!responded) {
           console.log('No response within timeout');
-          statusDiv.textContent = 'Error: Timeout - no response from content script';
+          statusDiv.textContent = 'Warning: Timeout - no response from content script';
         }
       }, 10000);
     } else {
-      statusDiv.textContent = 'Please navigate to school.mos.ru first.';
+      statusDiv.textContent = 'Перейдите в МЭШ.';
     }
   });
   });
@@ -224,11 +228,11 @@ document.getElementById('setMarks').addEventListener('click', () => {
       setTimeout(() => {
         if (!responded) {
           console.log('No response within timeout');
-          statusDiv.textContent = 'Error: Timeout - no response from content script';
+          statusDiv.textContent = 'Warning: Timeout - no response from content script';
         }
       }, 10000);
     } else {
-      statusDiv.textContent = 'Please navigate to school.mos.ru first.';
+      statusDiv.textContent = 'Перейдите в МЭШ.';
     }
   });
 });
@@ -245,7 +249,7 @@ document.getElementById('syncKTP').addEventListener('click', () => {
       chrome.tabs.sendMessage(tabs[0].id, { action: 'syncKTP' }, (response) => {
         if (chrome.runtime.lastError) {
           console.error('Runtime error:', chrome.runtime.lastError);
-          statusDiv.textContent = 'Error: ' + chrome.runtime.lastError.message + '. Try reloading the page.';
+          statusDiv.textContent = 'Перезагрузите страницу.';
           return;
         }
         responded = true;
@@ -264,7 +268,7 @@ document.getElementById('syncKTP').addEventListener('click', () => {
         }
       }, 10000);
     } else {
-      statusDiv.textContent = 'Please navigate to school.mos.ru first.';
+      statusDiv.textContent = 'Перейдите в МЭШ.';
     }
   });
 });

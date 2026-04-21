@@ -52,11 +52,11 @@ async function setHomeworkAbsences(groupId, absenceDate) {
       sendLog(`✅ Absence set for group ${groupId} on ${absenceDate}`);
       return await response.json();
     } else {
-      sendError(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
+      //sendError(`❌ Error for group ${groupId}: ${response.status} ${response.statusText}`);
       return { error: response.statusText, status: response.status };
     }
   } catch (e) {
-    sendError(`❌ Request failed: ${e}`);
+    //sendError(`❌ Request failed: ${e}`);
     return { error: e.message };
   }
 }
@@ -128,7 +128,7 @@ function getDaysInMonth(year, month) {
 
 async function main() {
   if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
+    throw new Error('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
   const groups = await getGroups();
@@ -138,7 +138,9 @@ async function main() {
 
     if (period) {
         sendLog(`📅 Обработка периода: ${period.startMonth}-${period.endMonth} / ${period.year}`);
-        
+        let current = 0;
+        const total = groups.length * (period.endMonth - period.startMonth + 1) * 31; // Максимум 31 день в месяце
+        sendProgress(0);
         for (const group of groups) {
             sendLog(`👥 Группа: ${group}`);
             
@@ -154,13 +156,18 @@ async function main() {
                 await setHomeworkAbsences(group, absenceDate);
                 // Небольшая задержка, чтобы не перегружать сервер
                 await new Promise(resolve => setTimeout(resolve, 100));
+                  current++;
+                  sendProgress((current / total) * 100);
                 } catch (error) {
-                sendError(`❌ Ошибка для ${absenceDate}: ${error.message}`);
+                  current++;
+                  sendProgress((current / total) * 100);
+                //sendError(`❌ Ошибка для ${absenceDate}: ${error.message}`);
                 }
             }
             }
         }
     }
+    sendProgress(100);
 }
 
 /**
@@ -224,7 +231,7 @@ async function getAcademicYear(groups) {
 
 async function syncKTP() {
   if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Required cookies not found. Please ensure you are logged in to school.mos.ru');
+    throw new Error('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
   const groups = await getGroups();
@@ -232,17 +239,25 @@ async function syncKTP() {
 
   const academPlans = await getAcademicYear(groups);
   sendLog(`📋 Найдено календарей: ${academPlans.length}`);
+  let current = 0;
+  const total = academPlans.length;
+  sendProgress(0);
   for(const calc of academPlans){
     try{
         await calendarPlans(calc);
         await new Promise(resolve => setTimeout(resolve, 1000));
         await calendarPlans(calc, 'recalc');
+        current++;
+        sendProgress((current / total) * 100  );
         sendLog(`✅ Календарь ${calc} обработан успешно`);
     }catch(error){
+      current++;
+      sendProgress((current / total) * 100);
         sendError(`❌ Ошибка при синхронизации KTP для календарного плана ${calc}: ${error.message}`);
     }
 
   }
+  sendProgress(100);
 
 }
 
@@ -423,11 +438,18 @@ function randomizeMark(mark) {
   return (candidate >= 1 && candidate <= 5) ? candidate : mark;
 }
 
+function sendProgress(value) {
+  chrome.runtime.sendMessage({ type: 'progress', value: value });
+}
+
 async function setMarks(students_marks, lessons, control_form_id, grade_system_id, course_lesson_topic_id){
   const results = {
     success: [],  // Успешные запросы
     errors: []    // Ошибки с деталями
   };
+  const total = lessons.length * students_marks.length;
+  let current = 0;
+  sendProgress(0); // Начальный прогресс
   for(const lesson of lessons){
     for(const stMark of students_marks){
       try{
@@ -459,6 +481,8 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
           body: JSON.stringify(payload), // Аналог json.dumps()
           credentials: 'include'         // Отправка cookies сессии
         });
+        current++;
+        sendProgress((current / total) * 100);
         if (!response.ok) {
           // 🔸 Логируем, но НЕ прерываем выполнение
           const errorInfo = {
@@ -482,6 +506,8 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
           response: result
         });
       }catch(error){
+        current++;
+        sendProgress((current / total) * 100);
         sendError('Error in setMarks: ' + error.message);
         results.errors.push({
           lesson,
@@ -493,6 +519,7 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
       
     }
   }
+  sendProgress(100); // Завершающий прогресс
   return results;
 }
 // Listen for messages from popup
