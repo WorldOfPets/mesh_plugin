@@ -4,8 +4,7 @@
   "version": "1.1",
   "description": "Extension to mesh",
   "permissions": [
-    "activeTab",
-    "storage"
+    "activeTab"
   ],
   "host_permissions": [
     "https://school.mos.ru/*"
