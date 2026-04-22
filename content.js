@@ -295,7 +295,18 @@ async function selectGroups() {
 let _CONTROL_FORM_ID = null;
 let _GRADE_SYSTEM_ID = null;
 let _COURSE_LESSON_TOPIC_ID = null;
-async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_ids) {
+function formatDateForApi(dateString) {
+  if (!dateString) {
+    return null;
+  }
+  const [year, month, day] = dateString.split('-');
+  if (!year || !month || !day) {
+    return null;
+  }
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
+async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_ids, use_lesson_date_range = false, lesson_date_from = '', lesson_date_to = '') {
   try {
     const period = getCurrentAcademicPeriod();
     dateFrom = period ? `${period.startDay.toString().padStart(2, '0')}.${period.startMonth.toString().padStart(2, '0')}.${period.year}` : null;
@@ -327,7 +338,11 @@ async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_i
       ? courselevelvalue 
       : null;
     const averageMarks = await getAverageMarks(group_id, subject_id, student_ids);
-    const lessonsIds = await getLessons(group_id, subject_id);
+    const lessonsIds = await getLessons(group_id, subject_id, {
+      useDateRange: use_lesson_date_range,
+      from: lesson_date_from,
+      to: lesson_date_to
+    });
 
     return {
       controlFormId: _CONTROL_FORM_ID,
@@ -343,10 +358,25 @@ async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_i
 
 }
 
-async function getLessons(group_id, subject_id){
+async function getLessons(group_id, subject_id, options = {}){
   const period = getCurrentAcademicPeriod();
-  dateFrom = period ? `${period.year}-${period.startMonth.toString().padStart(2, '0')}-${period.startDay.toString().padStart(2, '0')}` : null;
-  dateTo = period ? `${period.year}-${period.endMonth.toString().padStart(2, '0')}-${period.endDay.toString().padStart(2, '0')}` : null;
+  let dateFrom = period ? `${period.year}-${period.startMonth.toString().padStart(2, '0')}-${period.startDay.toString().padStart(2, '0')}` : null;
+  let dateTo = period ? `${period.year}-${period.endMonth.toString().padStart(2, '0')}-${period.endDay.toString().padStart(2, '0')}` : null;
+
+  if (options.useDateRange && options.from && options.to) {
+    const customFrom = formatDateForApi(options.from);
+    const customTo = formatDateForApi(options.to);
+
+    if (customFrom && customTo) {
+      if (new Date(customFrom) <= new Date(customTo)) {
+        dateFrom = customFrom;
+        dateTo = customTo;
+      } else {
+        sendError('Дата "От" должна быть меньше или равна дате "До". Используется стандартный период.');
+      }
+    }
+  }
+
   const url = `${BASE_URL}/profeducation/plan/teacher/v1/schedule_items?` +
       `academic_year_id=${aid}&` +
       `group_ids=${group_id}&` +
@@ -374,11 +404,8 @@ async function getLessons(group_id, subject_id){
     
     if (Array.isArray(data)) {
       for (const item of data) {
-        // 🔸 Фильтрация по subject_id (если нужно — раскомментируйте)
-        // if (subject_id && item.subject_id !== subject_id) continue;
-        
-        const lessonId = item.id; // schedule_item_id
-        if (lessonId != null) { // Проверка на null/undefined
+        const lessonId = item.id;
+        if (lessonId != null) {
           lessonIds.push(Number(lessonId));
         }
       }
@@ -556,7 +583,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
     return true; // Keep the message channel open for async response
   } else if (request.action === "setDefaultForMarks"){
-    setDefaultForMarks(request.group_id, request.subject_id, request.class_level_id, request.student_ids).then(result => {
+    setDefaultForMarks(
+      request.group_id,
+      request.subject_id,
+      request.class_level_id,
+      request.student_ids,
+      request.use_lesson_date_range,
+      request.lesson_date_from,
+      request.lesson_date_to
+    ).then(result => {
       sendResponse({ success: true, result: result });
     }).catch(error => {
       sendError('Error in setDefaultForMarks: ' + error.message);

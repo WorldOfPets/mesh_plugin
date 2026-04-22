@@ -7,6 +7,7 @@
     body { width: 350px; padding: 10px; }
     button { width: 100%; padding: 10px; margin: 10px 0; }
     #status { margin-top: 10px; white-space: pre-wrap; }
+    #useLessonDateRange { margin: 0px; padding: 0px; }
   </style>
 </head>
 <body>
@@ -14,6 +15,20 @@
   <span>Поддержать автора - кошелек ЮMoney: 4100 1195 1823 6176</span>
   <button id="startBtn">Без ДЗ на все даты</button>
   <button id="syncKTP">Синхронизация KTP</button>
+  <div style="margin: 10px 0px;">
+    <label >
+      <input type="checkbox" id="useLessonDateRange">
+      Выбрать диапазон дат уроков
+    </label>
+    <div style="display: none; gap: 8px;" id="lessonDateRange">
+      <label style="flex: 1;">
+        От:<input type="date" id="lessonDateFrom" style="width: 80%;">
+      </label>
+      <label style="flex: 1;">
+        До:<input type="date" id="lessonDateTo" style="width: 80%;">
+      </label>
+    </div>
+  </div>
   
   <select id="groupSelect" style="width: 100%; height: 40px;">
   </select>

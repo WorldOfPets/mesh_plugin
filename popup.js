@@ -94,9 +94,40 @@ let SUBJECT_ID = null;
 let GRADE_SYSTEM_ID = null;
 let COURSE_LESSON_TOPIC_ID = null;
 
+function getLessonDateRange() {
+  const useLessonDateRange = document.getElementById('useLessonDateRange');
+  const lessonDateFrom = document.getElementById('lessonDateFrom');
+  const lessonDateTo = document.getElementById('lessonDateTo');
+
+  const isEnabled = Boolean(useLessonDateRange?.checked);
+  const dateFrom = lessonDateFrom?.value || '';
+  const dateTo = lessonDateTo?.value || '';
+
+  return {
+    useLessonDateRange: isEnabled,
+    dateFrom,
+    dateTo
+  };
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const groupSelect = document.getElementById('groupSelect');
   const statusDiv = document.getElementById('status');
+  const useLessonDateRange = document.getElementById('useLessonDateRange');
+  const lessonDateFrom = document.getElementById('lessonDateFrom');
+  const lessonDateTo = document.getElementById('lessonDateTo');
+  const lessonDateRange = document.getElementById('lessonDateRange');
+
+  const updateLessonDateInputs = () => {
+    const disabled = !useLessonDateRange.checked;
+    lessonDateRange.style.display = disabled ? 'none' : 'flex';
+    lessonDateFrom.disabled = disabled;
+    lessonDateTo.disabled = disabled;
+  };
+
+  updateLessonDateInputs();
+  useLessonDateRange.addEventListener('change', updateLessonDateInputs);
+
   statusDiv.textContent = 'Starting...';
   console.log('Button clicked, querying tabs...');
 
@@ -154,13 +185,28 @@ document.addEventListener('DOMContentLoaded', () => {
     SUBJECT_ID = selectedOption.dataset.subjectId;
     GROUP_ID = e.target.value;
     const studentIds = selectedOption.dataset.studentIds;
+    const lessonDateRange = getLessonDateRange();
+
+    if (lessonDateRange.useLessonDateRange && (!lessonDateRange.dateFrom || !lessonDateRange.dateTo)) {
+      statusDiv.textContent = 'Выберите обе даты: от и до.';
+      return;
+    }
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     console.log('Active tab:', tabs[0]);
     if (tabs[0] && tabs[0].url.includes('school.mos.ru')) {
       console.log('Sending message to tab:', tabs[0].id);
       let responded = false;
-      chrome.tabs.sendMessage(tabs[0].id, { action: 'setDefaultForMarks', group_id: GROUP_ID, subject_id: SUBJECT_ID, class_level_id: classLevelId, student_ids: studentIds }, (response) => {
+      chrome.tabs.sendMessage(tabs[0].id, {
+        action: 'setDefaultForMarks',
+        group_id: GROUP_ID,
+        subject_id: SUBJECT_ID,
+        class_level_id: classLevelId,
+        student_ids: studentIds,
+        use_lesson_date_range: lessonDateRange.useLessonDateRange,
+        lesson_date_from: lessonDateRange.dateFrom,
+        lesson_date_to: lessonDateRange.dateTo
+      }, (response) => {
         if (chrome.runtime.lastError) {
           console.error('Runtime error:', chrome.runtime.lastError);
           statusDiv.textContent = 'Перезагрузите страницу.';
