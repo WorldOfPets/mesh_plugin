@@ -457,6 +457,7 @@ async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 
   
 }
 function randomizeMark(mark) {
+  mark = Math.round(mark)
   if (mark === 5) return Math.random() < 0.2 ? 4 : 5;
   if (Math.random() >= 0.2) return mark;
   
