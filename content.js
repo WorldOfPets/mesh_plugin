@@ -1,9 +1,21 @@
-function getCookie(name) {
-  const value = `; ${document.cookie}`;
-  const parts = value.split(`; ${name}=`);
-  if (parts.length === 2) return parts.pop().split(';').shift();
-  return null;
-}
+const CONFIG = {
+  API_BASE: 'https://school.mos.ru/api',
+  COOKIES: {
+    TOKEN: 'aupd_token',
+    PROFILE_ID: 'profile_id',
+    AID: 'aid',
+    SUBSYSTEM_ID: 'subsystem_id'
+  },
+  DELAYS: {
+    ABSENCE: 100, // мс между запросами "Без ДЗ"
+    KTP: 1000     // мс между действиями КТП
+  }
+};
+
+const getCookie = (name) => {
+  const match = document.cookie.match(`(^|;)\\s*${name}\\s*=\\s*([^;]+)`);
+  return match ? decodeURIComponent(match.pop()) : null;
+};
 
 
 function sendLog(message) {
@@ -14,38 +26,29 @@ function sendError(message) {
   chrome.runtime.sendMessage({ type: 'error', message: message });
 }
 
-const BASE_URL = "https://school.mos.ru/api";
-const token = getCookie('aupd_token');
-const teacherId = getCookie('profile_id');
-const aid = getCookie('aid');
-const subsystemId = getCookie('subsystem_id');
-
-const HEADERS = {
-  'Authorization': `Bearer ${token}`,
+const createHeaders = () => ({
+  'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
   'x-mes-subsystem': 'journalw',
   'Content-Type': 'application/json',
-    'aid': aid,
-    'profile-id': teacherId.toString(),
-    'x-mes-hostid': subsystemId,
-    'origin': 'https://school.mos.ru',
-    'referer': 'https://school.mos.ru/',
-};
+  'aid': getCookie(CONFIG.COOKIES.AID),
+  'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
+  'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
+  'origin': CONFIG.API_BASE.replace('/api', ''),
+  'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
+});
 
 async function setHomeworkAbsences(groupId, absenceDate) {
-  const url = `${BASE_URL}/profeducation/core/teacher/v1/homework_absences`;
-  const headers = {
-    ...HEADERS,
-  };
+  const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/homework_absences`;
   const payload = {
     group_id: groupId,
     date: absenceDate,
-    created_by: teacherId.toString()
+    created_by: getCookie(CONFIG.COOKIES.PROFILE_ID).toString()
   };
 
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: headers,
+      headers: createHeaders(),
       body: JSON.stringify(payload)
     });
     if (response.ok) {
@@ -62,12 +65,12 @@ async function setHomeworkAbsences(groupId, absenceDate) {
 }
 
 async function getGroups() {
-  const url = `${BASE_URL}/profeducation/core/teacher/v1/teacher_profiles/${teacherId}?with_assigned_groups=true&with_replacement_groups=true`;
-  const headers = { ...HEADERS};
+  
+  const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/teacher_profiles/${getCookie(CONFIG.COOKIES.PROFILE_ID)}?with_assigned_groups=true&with_replacement_groups=true`;
   try {
     const response = await fetch(url, { 
       method: 'GET',
-      headers,
+      headers: createHeaders(),
       credentials: 'include'
     });
     if (response.ok) {
@@ -127,8 +130,8 @@ function getDaysInMonth(year, month) {
 }
 
 async function main() {
-  if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Перезайдите в учетную запись МЭШ.');
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
   const groups = await getGroups();
@@ -177,14 +180,12 @@ async function main() {
  */
 async function calendarPlans(journal, finistOrRecalc = 'finish') {
    //  'recalc' в зависимости от нужного действия
-  const url = `${BASE_URL}/profeducation/plan/teacher/v1/calendar_plans/${journal}/${finistOrRecalc}?ignore_IA=true`;
-  
-  const headers = { ...HEADERS, };
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/calendar_plans/${journal}/${finistOrRecalc}?ignore_IA=true`;
   
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers,
+      headers: createHeaders(),
     });
     
     sendLog('Calendar plans response: ' + response.status);
@@ -204,13 +205,12 @@ async function getAcademicYear(groups) {
   // Преобразуем массив в строку "1,2,3"
   const groupsStr = groups.map(String).join(',');
   
-  const url = `${BASE_URL}/profeducation/plan/teacher/v1/calendar_plans?academic_year_id=${aid}&group_ids=${groupsStr}`;
-  const headers = { ...HEADERS, };
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/calendar_plans?academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&group_ids=${groupsStr}`;
   
   try {
     const response = await fetch(url, { 
       method: 'GET',
-      headers,
+      headers: createHeaders(),
     });
     
     if (!response.ok) {
@@ -230,8 +230,8 @@ async function getAcademicYear(groups) {
 }
 
 async function syncKTP() {
-  if (!token || !teacherId || !aid || !subsystemId) {
-    throw new Error('Перезайдите в учетную запись МЭШ.');
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
   const groups = await getGroups();
@@ -262,19 +262,21 @@ async function syncKTP() {
 }
 
 async function selectGroups() {
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
+  }
   const groups = await getGroups();
   const groupsStr = groups.map(String).join(',');
-  const url = BASE_URL + '/profeducation/plan/teacher/v1/groups' +
-    '?academic_year_id=' + aid +
+  const url = CONFIG.API_BASE + '/profeducation/plan/teacher/v1/groups' +
+    '?academic_year_id=' + getCookie(CONFIG.COOKIES.AID) +
     '&group_ids=' + groupsStr +
     '&with_periods_schedule_id=true' +
     '&with_parallel_curriculum_id=true' +
     '&with_lesson_plans_info=true';
-  const headers = { ...HEADERS};
   try {
     const response = await fetch(url, { 
       method: 'GET',
-      headers, 
+      headers: createHeaders(), 
       credentials: 'include'
     });
     
@@ -308,10 +310,13 @@ function formatDateForApi(dateString) {
 
 async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_ids, use_lesson_date_range = false, lesson_date_from = '', lesson_date_to = '') {
   try {
+    if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+      sendError('Перезайдите в учетную запись МЭШ.');
+    }
     const period = getCurrentAcademicPeriod();
     dateFrom = period ? `${period.startDay.toString().padStart(2, '0')}.${period.startMonth.toString().padStart(2, '0')}.${period.year}` : null;
     dateTo = period ? `${period.endDay.toString().padStart(2, '0')}.${period.endMonth.toString().padStart(2, '0')}.${period.year}` : null;
-    const urlmarks = `${BASE_URL}/profeducation/core/teacher/v1/marks?` +
+    const urlmarks = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/marks?` +
       `group_ids=${group_id}&` +
       `subject_id=${subject_id}&` +
       
@@ -319,9 +324,7 @@ async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_i
       `created_at_to=${dateTo}&` 
     const response = await fetch(urlmarks, {
       method: 'GET',
-      headers: {
-        ...HEADERS,
-      },
+      headers: createHeaders(),
       credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
     });
     if (!response.ok) {
@@ -377,11 +380,11 @@ async function getLessons(group_id, subject_id, options = {}){
     }
   }
 
-  const url = `${BASE_URL}/profeducation/plan/teacher/v1/schedule_items?` +
-      `academic_year_id=${aid}&` +
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/schedule_items?` +
+      `academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&` +
       `group_ids=${group_id}&` +
       `subject_id=${subject_id}&` +
-      `teacher_id=${teacherId}&` +
+      `teacher_id=${getCookie(CONFIG.COOKIES.PROFILE_ID)}&` +
       `from=${dateFrom}&` +
       `to=${dateTo}&` +
       `with_group_class_subject_info=true&` +
@@ -392,7 +395,7 @@ async function getLessons(group_id, subject_id, options = {}){
 
   const response = await fetch(url, {
     method: 'GET',
-    headers: {...HEADERS},
+    headers: createHeaders(),
 
   });
   if (!response.ok) {
@@ -415,14 +418,12 @@ async function getLessons(group_id, subject_id, options = {}){
     return lessonIds;
 }
 
-async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 3) {
+async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 0) {
   try{
-    const url = `${BASE_URL}/profeducation/core/teacher/v1/average_marks_year?group_ids=${group_id}&student_profile_ids=${student_ids}&subject_id=${subject_id}`;
+    const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/average_marks_year?group_ids=${group_id}&student_profile_ids=${student_ids}&subject_id=${subject_id}`;
     const response = await fetch(url, {
         method: 'GET',
-        headers: {
-          ...HEADERS,
-        },
+        headers: createHeaders(),
         credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
       });
     const allStudentIds = student_ids
@@ -435,9 +436,11 @@ async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 
       if (Array.isArray(data)) {
         const markField = `average_mark_five`;
         for (const item of data) {
+          const rawMark = item[markField];
+          const hasMark = rawMark != null && rawMark !== '';
           marksMap.set(item.student_id, {
-            average_mark: Number(item[markField] ?? defaultMark),
-            has_mark: true
+            average_mark: hasMark ? Number(rawMark) : defaultMark,
+            has_mark: hasMark
           });
         }
       }
@@ -471,17 +474,25 @@ function sendProgress(value) {
 }
 
 async function setMarks(students_marks, lessons, control_form_id, grade_system_id, course_lesson_topic_id){
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
+  }
   const results = {
     success: [],  // Успешные запросы
     errors: []    // Ошибки с деталями
   };
-  const total = lessons.length * students_marks.length;
+  const marksToSet = students_marks.filter(st => st.has_mark);
+  const total = lessons.length * marksToSet.length;
   let current = 0;
-  sendProgress(0); // Начальный прогресс
+  sendProgress(0);
+  if (total === 0) {
+    sendProgress(100);
+    return results;
+  }
   for(const lesson of lessons){
-    for(const stMark of students_marks){
+    for(const stMark of marksToSet){
       try{
-        const url = `${BASE_URL}/profeducation/core/teacher/v1/marks`;
+        const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/marks`;
         const payload = {
           comment: "",
           is_exam: false,
@@ -490,7 +501,7 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
           point_date: "",
           schedule_lesson_id: lesson,
           student_profile_id: stMark.student_id,
-          teacher_id: teacherId,           // Глобальная константа
+          teacher_id: getCookie(CONFIG.COOKIES.PROFILE_ID),           // Глобальная константа
           control_form_id: control_form_id, // Глобальная переменная
           weight: 1,
           theme_frame_integration_id: null,  // Python None → JS null
@@ -505,7 +516,7 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
         };
         const response = await fetch(url, {
           method: 'POST',
-          headers: { ...HEADERS},
+          headers: createHeaders(),
           body: JSON.stringify(payload), // Аналог json.dumps()
           credentials: 'include'         // Отправка cookies сессии
         });
