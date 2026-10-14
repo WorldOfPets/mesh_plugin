@@ -82,6 +82,16 @@ document.addEventListener('DOMContentLoaded', () => {
   const lessonDateTo = document.getElementById('lessonDateTo');
   const lessonDateRange = document.getElementById('lessonDateRange');
 
+  // Устанавливаем дефолтные даты для диапазона ДЗ
+  const today = new Date();
+  const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+  const todayStr = today.toISOString().split('T')[0];
+  const firstDayStr = firstDay.toISOString().split('T')[0];
+  const hwDateFrom = document.getElementById('hwDateFrom');
+  const hwDateTo = document.getElementById('hwDateTo');
+  if (hwDateFrom) hwDateFrom.value = firstDayStr;
+  if (hwDateTo) hwDateTo.value = todayStr;
+
   const updateLessonDateInputs = () => {
     const disabled = !useLessonDateRange.checked;
     lessonDateRange.style.display = disabled ? 'none' : 'flex';
@@ -277,6 +287,65 @@ document.getElementById('syncKTP').addEventListener('click', () => {
           statusDiv.textContent = 'Error: Timeout - no response from content script';
         }
       }, 10000);
+    } else {
+      statusDiv.textContent = 'Перейдите в МЭШ.';
+    }
+  });
+});
+
+// Кнопка добавления ДЗ на диапазон дат
+document.getElementById('addHomeworkBtn').addEventListener('click', () => {
+  const statusDiv = document.getElementById('status');
+  const description = document.getElementById('hwDescription').value;
+  const dateFrom = document.getElementById('hwDateFrom').value;
+  const dateTo = document.getElementById('hwDateTo').value;
+
+  if (!description || !dateFrom || !dateTo) {
+    statusDiv.textContent = 'Заполните описание и диапазон дат.';
+    return;
+  }
+
+  if (dateFrom > dateTo) {
+    statusDiv.textContent = 'Дата "С" не может быть позже даты "По".';
+    return;
+  }
+
+  // Форматируем даты в ДД.ММ.ГГГГ
+  const formatDate = (dateStr) => {
+    const [y, m, d] = dateStr.split('-');
+    return `${d}.${m}.${y}`;
+  };
+
+  statusDiv.textContent = 'Массовое добавление ДЗ...';
+  console.log('Sending addHomeworkForPeriod action...');
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0] && tabs[0].url.includes('school.mos.ru')) {
+      let responded = false;
+      chrome.tabs.sendMessage(tabs[0].id, {
+        action: 'addHomeworkForPeriod',
+        description: description,
+        date_from: formatDate(dateFrom),
+        date_to: formatDate(dateTo)
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('Runtime error:', chrome.runtime.lastError);
+          statusDiv.textContent = 'Ошибка: ' + chrome.runtime.lastError.message + '. Перезагрузите страницу.';
+          return;
+        }
+        responded = true;
+        console.log('Response received:', response);
+        if (response && response.success) {
+          statusDiv.textContent = 'ДЗ успешно добавлено на диапазон!';
+        } else {
+          statusDiv.textContent = 'Ошибка: ' + (response?.error || 'Нет ответа');
+        }
+      });
+      setTimeout(() => {
+        if (!responded) {
+          statusDiv.textContent = 'Таймаут - нет ответа от content script';
+        }
+      }, 30000);
     } else {
       statusDiv.textContent = 'Перейдите в МЭШ.';
     }

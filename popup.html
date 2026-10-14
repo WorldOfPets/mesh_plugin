@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>МЫШЬ 2.0</title>
+  <title>МЫШЬ 2.1</title>
   <style>
     body { width: 350px; padding: 10px; }
     button { width: 100%; padding: 10px; margin: 10px 0; }
@@ -11,7 +11,7 @@
   </style>
 </head>
 <body>
-  <h1>МЫШЬ 2.0</h1>
+  <h1>МЫШЬ 2.1</h1>
   <span>Поддержать автора - кошелек ЮMoney: 4100 1195 1823 6176</span>
   <button id="startBtn">Без ДЗ на все даты</button>
   <button id="syncKTP">Синхронизация KTP</button>
@@ -33,6 +33,28 @@
   <select id="groupSelect" style="width: 100%; height: 40px;">
   </select>
   <button id="setMarks">Выставлять оценки</button>
+  
+  <hr style="margin: 15px 0;">
+  <h3>Добавить ДЗ на диапазон дат</h3>
+  
+  <label style="display: block; margin: 5px 0;">
+    Описание:
+    <textarea id="hwDescription" style="width: 100%; height: 60px;" placeholder="Повторить материал пройденный на занятиях https://metanit.com/">Повторить материал пройденный на занятиях https://metanit.com/</textarea>
+  </label>
+  
+  <div style="display: flex; gap: 8px; margin: 5px 0;">
+    <label style="flex: 1;">
+    С:
+    <input type="date" id="hwDateFrom" style="width: 100%;">
+    </label>
+    <label style="flex: 1;">
+    По:
+    <input type="date" id="hwDateTo" style="width: 100%;">
+    </label>
+  </div>
+  
+  <button id="addHomeworkBtn">Добавить ДЗ на диапазон</button>
+  
   <progress id="progressBar" value="0" max="100" style="width: 100%; height: 40px;"> 0% </progress>
   
   <div id="status"></div>

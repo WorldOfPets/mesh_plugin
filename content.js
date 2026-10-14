@@ -469,6 +469,190 @@ function randomizeMark(mark) {
   return (candidate >= 1 && candidate <= 5) ? candidate : mark;
 }
 
+/**
+ * Создаёт/добавляет домашнее задание для группы через API
+ * @param {Object} params - Параметры домашнего задания
+ * @param {number|string} params.group_id - ID группы
+ * @param {number|string} params.subject_id - ID предмета
+ * @param {number|string} params.teacher_id - ID учителя (profile_id)
+ * @param {string} params.student_ids - Строка ID учеников через запятую
+ * @param {string} params.description - Описание домашнего задания
+ * @param {number|string} params.duration - Длительность в минутах
+ * @param {string} params.date_assigned_on - Дата выдачи (ДД.ММ.ГГГГ)
+ * @param {string} params.date_prepared_for - Дата сдачи (ДД.ММ.ГГГГ)
+ * @returns {Promise<Object>} - Результат от сервера
+ */
+async function addHomework({ group_id, subject_id, teacher_id, student_ids, description, duration, date_assigned_on, date_prepared_for }) {
+  const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/homeworks`;
+  
+  const headers = {
+    'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
+    'x-mes-subsystem': 'teacherspow',  // Для ДЗ нужна подсистема teacherspow
+    'Content-Type': 'application/json',
+    'aid': getCookie(CONFIG.COOKIES.AID),
+    'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
+    'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
+    'origin': CONFIG.API_BASE.replace('/api', ''),
+    'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
+  };
+
+  // Если teacher_id не передан (null), берём из куки profile_id
+  const effectiveTeacherId = teacher_id || getCookie(CONFIG.COOKIES.PROFILE_ID);
+
+  const payload = {
+    group_id: Number(group_id),
+    teacher_id: Number(effectiveTeacherId),
+    date_assigned_on: date_assigned_on,
+    date_prepared_for: date_prepared_for,
+    subject_id: Number(subject_id),
+    homework_entries_attributes: [{
+      description: description,
+      duration: Number(duration),
+      attachment_ids: [],
+      attachments: [],
+      scripts: null,
+      student_ids: student_ids
+        .split(',')
+        .map(id => Number(id.trim()))
+        .filter(id => !isNaN(id) && id > 0)
+    }]
+  };
+
+  try {
+    sendLog(`📝 Добавление ДЗ: группа=${group_id}, предмет=${subject_id}, дата=${date_assigned_on}`);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      sendLog(`✅ ДЗ успешно добавлено для группы ${group_id}`);
+      return { success: true, result };
+    } else {
+      const errorText = await response.text();
+      sendError(`❌ Ошибка при добавлении ДЗ: ${response.status} ${response.statusText} — ${errorText}`);
+      return { success: false, error: errorText, status: response.status };
+    }
+  } catch (e) {
+    sendError(`❌ Ошибка запроса ДЗ: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Массовое добавление ДЗ на указанный диапазон дат для всех групп.
+ * @param {Object} params
+ * @param {string} params.description - Описание ДЗ
+ * @param {string} params.date_from - Начало диапазона (ДД.ММ.ГГГГ)
+ * @param {string} params.date_to - Конец диапазона (ДД.ММ.ГГГГ)
+ */
+async function addHomeworkForPeriod({ description, date_from, date_to }) {
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
+    return;
+  }
+
+  sendLog('📚 Начинаю массовое добавление ДЗ...');
+
+  const groupIds = await getGroups();
+  sendLog('👥 Группы (ID): ' + JSON.stringify(groupIds));
+
+  if (!groupIds || groupIds.length === 0) {
+    sendError('Нет доступных групп.');
+    return;
+  }
+
+  const detailedGroups = await selectGroups();
+  sendLog('📋 Детальная информация по группам: получено ' + (detailedGroups?.length || 0));
+
+  const groupMap = new Map();
+  if (Array.isArray(detailedGroups)) {
+    for (const g of detailedGroups) {
+      groupMap.set(Number(g.id), {
+        subject_id: g.subject_id,
+        student_ids: Array.isArray(g.student_ids) ? g.student_ids.join(',') : '',
+        name: g.name || ''
+      });
+    }
+  }
+
+  const teacher_id = getCookie(CONFIG.COOKIES.PROFILE_ID);
+  const DURATION = 15; // фиксированная длительность 15 минут
+
+  // Парсим date_from и date_to (формат ДД.ММ.ГГГГ)
+  const parseDate = (str) => {
+    const [d, m, y] = str.split('.');
+    return new Date(Number(y), Number(m) - 1, Number(d));
+  };
+
+  const startDate = parseDate(date_from);
+  const endDate = parseDate(date_to);
+
+  if (isNaN(startDate) || isNaN(endDate)) {
+    sendError('❌ Неверный формат дат.');
+    return;
+  }
+
+  if (startDate > endDate) {
+    sendError('❌ Дата начала больше даты окончания.');
+    return;
+  }
+
+  // Собираем все даты в диапазоне
+  const dates = [];
+  const currentDate = new Date(startDate);
+  while (currentDate <= endDate) {
+    dates.push(`${currentDate.getDate().toString().padStart(2, '0')}.${(currentDate.getMonth() + 1).toString().padStart(2, '0')}.${currentDate.getFullYear()}`);
+    currentDate.setDate(currentDate.getDate() + 1);
+  }
+
+  const total = groupIds.length * dates.length;
+  let progressCount = 0;
+  sendProgress(0);
+
+  for (const groupId of groupIds) {
+    const groupInfo = groupMap.get(Number(groupId));
+    if (!groupInfo || !groupInfo.subject_id || !groupInfo.student_ids) {
+      sendLog(`⚠️ Пропускаю группу ${groupId}: нет данных о предмете или студентах`);
+      continue;
+    }
+
+    sendLog(`👥 Группа: ${groupId} (${groupInfo.name}), предмет: ${groupInfo.subject_id}`);
+
+    for (const dateStr of dates) {
+      try {
+        const result = await addHomework({
+          group_id: groupId,
+          subject_id: groupInfo.subject_id,
+          teacher_id: teacher_id,
+          student_ids: groupInfo.student_ids,
+          description: description,
+          duration: DURATION,
+          date_assigned_on: dateStr,        // дата выдачи = каждый день из диапазона
+          date_prepared_for: dateStr        // дата сдачи = та же дата (как в оригинальном примере)
+        });
+
+        progressCount++;
+        sendProgress((progressCount / total) * 100);
+
+        if (!result.success) {
+          sendLog(`⚠️ Ошибка для группы ${groupId} на ${dateStr}: ${result.error || result.status}`);
+        }
+      } catch (error) {
+        progressCount++;
+        sendProgress((progressCount / total) * 100);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  sendProgress(100);
+  sendLog('✅ Массовое добавление ДЗ завершено!');
+}
+
 function sendProgress(value) {
   chrome.runtime.sendMessage({ type: 'progress', value: value });
 }
@@ -617,5 +801,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendError('Error in setDefaultForMarks: ' + error.message);
       sendResponse({ success: false, error: error.message });
     })
+  } else if (request.action === "addHomework"){
+    addHomework({
+      group_id: request.group_id,
+      subject_id: request.subject_id,
+      teacher_id: request.teacher_id,
+      student_ids: request.student_ids,
+      description: request.description,
+      duration: request.duration,
+      date_assigned_on: request.date_assigned_on,
+      date_prepared_for: request.date_prepared_for
+    }).then(result => {
+      // Прокидываем result.success как outer success (результат самой addHomework)
+      sendResponse({ success: result.success, result: result });
+    }).catch(error => {
+      sendError('Error in addHomework: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true;
+  } else if (request.action === "addHomeworkForPeriod"){
+    addHomeworkForPeriod({
+      description: request.description,
+      date_from: request.date_from,
+      date_to: request.date_to
+    }).then(() => {
+      sendResponse({ success: true });
+    }).catch(error => {
+      sendError('Error in addHomeworkForPeriod: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true;
   }
 });
