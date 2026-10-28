@@ -653,6 +653,315 @@ async function addHomeworkForPeriod({ description, date_from, date_to }) {
   sendLog('✅ Массовое добавление ДЗ завершено!');
 }
 
+/**
+ * Материал по умолчанию, который добавляется ко всем занятиям
+ * в основной фиче без галочек.
+ */
+const DEFAULT_MATERIAL = {
+  uuid: '15a55adf-5096-5627-ab95-d616d55b016f',
+  original_uuid: '6b061b7c-b94f-43ca-8140-eb1e766da214',
+  name: 'Материалы занятия:\nhttps://metanit.com/\nhttps://www.freecodecamp.org/\nhttp://labex.io/'
+};
+
+/**
+ * Получает занятия с их структурой (lesson_plan_id/module_id/topic_id/lesson_id),
+ * необходимой для добавления материалов.
+ * @param {Object} params
+ * @param {string} params.group_id - ID группы
+ * @param {string} params.subject_id - ID предмета
+ * @param {string} params.date_from - Начало (ДД.ММ.ГГГГ)
+ * @param {string} params.date_to - Конец (ДД.ММ.ГГГГ)
+ * @returns {Promise<Array<Object>>} - Массив занятий
+ */
+async function getLessonsWithStructure({ group_id, subject_id, date_from, date_to }) {
+  const from = formatDateForApi(date_from.split('.').reverse().join('-'));
+  const to = formatDateForApi(date_to.split('.').reverse().join('-'));
+
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/schedule_items?` +
+    `academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&` +
+    `group_ids=${group_id}&` +
+    `subject_id=${subject_id}&` +
+    `teacher_id=${getCookie(CONFIG.COOKIES.PROFILE_ID)}&` +
+    `from=${from}&` +
+    `to=${to}&` +
+    `with_group_class_subject_info=true&` +
+    `with_course_calendar_info=true&` +
+    `with_lesson_info=true&` +
+    `with_rooms_info=true&` +
+    `with_availability_info=true&`;
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: createHeaders(),
+      credentials: 'include'
+    });
+    if (!response.ok) {
+      sendError(`❌ Не удалось получить занятия: HTTP ${response.status} ${response.statusText}`);
+      return [];
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) return [];
+    return data
+      .filter(item => item && item.lesson_plan_id && item.module_id && item.topic_id && item.lesson_id)
+      .map(item => ({
+        lesson_plan_id: item.lesson_plan_id,
+        module_id: item.module_id,
+        topic_id: item.topic_id,
+        lesson_id: item.lesson_id,
+        lesson_name: item.lesson_name || '',
+        date: Array.isArray(item.date) ? item.date.join('-') : ''
+      }));
+  } catch (e) {
+    sendError(`❌ Ошибка при получении занятий: ${e.message}`);
+    return [];
+  }
+}
+
+/**
+ * Хэдеры для работы с планом занятий (подсистема teacherspow).
+ */
+function createTeacherspowHeaders() {
+  return {
+    'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
+    'x-mes-subsystem': 'teacherspow',
+    'Content-Type': 'application/json',
+    'aid': getCookie(CONFIG.COOKIES.AID),
+    'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
+    'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
+    'origin': CONFIG.API_BASE.replace('/api', ''),
+    'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
+  };
+}
+
+/**
+ * Получает полный объект занятия (GET).
+ * @returns {Promise<Object>} - объект занятия как отдаёт сервер
+ */
+async function fetchLesson(lessonPlanId, moduleId, topicId, lessonId) {
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/lesson_plans/${lessonPlanId}/modules/${moduleId}/topics/${topicId}/lessons/${lessonId}`;
+  const response = await fetch(url, { method: 'GET', headers: createTeacherspowHeaders() });
+  if (!response.ok) {
+    throw new Error(`GET lesson HTTP ${response.status} ${response.statusText}`);
+  }
+  return await response.json();
+}
+
+/**
+ * Строит JSON-строку scripts, объединяя уже прикреплённые материалы с новыми.
+ * @param {Object} lesson - полный объект занятия от GET
+ * @param {Array<{uuid:string, original_uuid:string}>} materials
+ * @returns {string|null}
+ */
+function mergeScripts(lesson, materials) {
+  let scripts = [];
+  if (lesson && lesson.scripts) {
+    try {
+      const parsed = JSON.parse(lesson.scripts);
+      if (Array.isArray(parsed)) scripts = parsed;
+    } catch (e) {
+      scripts = [];
+    }
+  }
+
+  const existing = new Set(scripts.map(s => s && s.uuid).filter(Boolean));
+  for (const m of materials) {
+    if (!m || !m.uuid || existing.has(m.uuid)) continue;
+    existing.add(m.uuid);
+    scripts.push({
+      uuid: m.uuid,
+      original_uuid: m.original_uuid || m.uuid,
+      learningTargets: { forLesson: true, forHome: false },
+      isHiddenFromStudents: false
+    });
+  }
+
+  if (scripts.length === 0) return null;
+  return JSON.stringify(scripts);
+}
+
+/**
+ * Добавляет материалы к одному занятию.
+ * Делает GET занятия, подставляет scripts и отправляет PUT полный объект
+ * (как это делает сам сайт МЭШ), а не только поле scripts.
+ * @param {Object} lesson - { lesson_plan_id, module_id, topic_id, lesson_id }
+ * @param {Array<{uuid:string, original_uuid:string}>} materials
+ * @returns {Promise<Object>} - { success, status, error, added }
+ */
+async function addMaterialToLesson(lesson, materials) {
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/lesson_plans/${lesson.lesson_plan_id}/modules/${lesson.module_id}/topics/${lesson.topic_id}/lessons/${lesson.lesson_id}`;
+
+  try {
+    // 1) Берём полный объект занятия
+    const lessonObj = await fetchLesson(
+      lesson.lesson_plan_id,
+      lesson.module_id,
+      lesson.topic_id,
+      lesson.lesson_id
+    );
+
+    const beforeCount = (() => {
+      try { return (JSON.parse(lessonObj.scripts || '[]') || []).length; } catch (e) { return 0; }
+    })();
+
+    // 2) Объединяем материалы
+    const mergedScripts = mergeScripts(lessonObj, materials);
+    if (!mergedScripts) {
+      return { success: false, error: 'Нет материалов для добавления' };
+    }
+
+    // 3) Отправляем PUT с полным объектом (scripts заменяется)
+    const payload = Object.assign({}, lessonObj, { scripts: mergedScripts });
+
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: createTeacherspowHeaders(),
+      body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+      let afterCount = beforeCount;
+      try {
+        const data = await response.clone().json();
+        afterCount = (JSON.parse(data.scripts || '[]') || []).length;
+      } catch (e) { /* ignore */ }
+      return { success: true, added: afterCount - beforeCount, beforeCount, afterCount };
+    }
+
+    const errorText = await response.text();
+    console.error('[МЫШЬ] PUT lesson failed', { url, status: response.status, body: payload, response: errorText });
+    return { success: false, status: response.status, error: errorText };
+  } catch (e) {
+    console.error('[МЫШЬ] addMaterialToLesson error', e);
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Массовое добавление материалов ко всем занятиям на диапазон дат.
+ * @param {Object} params
+ * @param {string} params.date_from - Начало диапазона (ДД.ММ.ГГГГ)
+ * @param {string} params.date_to - Конец диапазона (ДД.ММ.ГГГГ)
+ * @param {Array<{uuid:string, original_uuid:string}>} [params.materials] -
+ *        Материалы для добавления. Если не переданы — используется DEFAULT_MATERIAL.
+ */
+async function addMaterialForPeriod({ date_from, date_to, materials }) {
+  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    sendError('Перезайдите в учетную запись МЭШ.');
+    return;
+  }
+
+  const materialsToAdd = (Array.isArray(materials) && materials.length > 0)
+    ? materials
+    : [DEFAULT_MATERIAL];
+
+  sendLog(`📎 Начинаю добавление материалов (${materialsToAdd.length} шт.) на период...`);
+
+  const groupIds = await getGroups();
+  if (!groupIds || groupIds.length === 0) {
+    sendError('Нет доступных групп.');
+    return;
+  }
+
+  const detailedGroups = await selectGroups();
+  const groupMap = new Map();
+  if (Array.isArray(detailedGroups)) {
+    for (const g of detailedGroups) {
+      groupMap.set(Number(g.id), {
+        subject_id: g.subject_id,
+        name: g.name || ''
+      });
+    }
+  }
+
+  // Собираем список всех занятий для обработки
+  const allLessons = [];
+  for (const groupId of groupIds) {
+    const groupInfo = groupMap.get(Number(groupId));
+    if (!groupInfo || !groupInfo.subject_id) {
+      sendLog(`⚠️ Пропускаю группу ${groupId}: нет данных о предмете`);
+      continue;
+    }
+    sendLog(`👥 Группа: ${groupId} (${groupInfo.name}), предмет: ${groupInfo.subject_id}`);
+
+    const lessons = await getLessonsWithStructure({
+      group_id: groupId,
+      subject_id: groupInfo.subject_id,
+      date_from: date_from,
+      date_to: date_to
+    });
+    for (const lesson of lessons) {
+      allLessons.push({ lesson, groupId });
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+
+  if (allLessons.length === 0) {
+    sendLog('⚠️ Не найдено занятий на указанный период.');
+    sendProgress(100);
+    return;
+  }
+
+  sendLog(`📚 Найдено занятий: ${allLessons.length}`);
+  let current = 0;
+  const total = allLessons.length;
+  let successCount = 0;
+  let failCount = 0;
+  let addedCount = 0;
+  let firstError = null;
+  sendProgress(0);
+
+  for (const { lesson, groupId } of allLessons) {
+    try {
+      const result = await addMaterialToLesson(lesson, materialsToAdd);
+      if (result.success) {
+        successCount++;
+        addedCount += (result.added || 0);
+        sendLog(`✅ Занятие ${lesson.lesson_id} (${lesson.lesson_name}): материал добавлен (+${result.added || 0}, всего ${result.afterCount})`);
+      } else {
+        failCount++;
+        const errMsg = `${result.status || ''} ${result.error || ''}`.trim();
+        if (!firstError) firstError = errMsg;
+        sendError(`❌ Занятие ${lesson.lesson_id}: ${errMsg}`);
+      }
+    } catch (error) {
+      failCount++;
+      if (!firstError) firstError = error.message;
+      sendError(`❌ Исключение для занятия ${lesson.lesson_id}: ${error.message}`);
+    }
+    current++;
+    sendProgress((current / total) * 100);
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+
+  sendProgress(100);
+  sendLog(`📊 Итог: успешно ${successCount}, ошибок ${failCount}, добавлено материалов ${addedCount}.`);
+  if (failCount > 0) {
+    sendLog(`❌ Первая ошибка: ${firstError}`);
+  }
+  return { successCount, failCount, addedCount, firstError };
+}
+
+/**
+ * Сохраняет зарегистрированный материал в chrome.storage.local,
+ * убирая дубликаты по uuid (самые свежие — сверху).
+ */
+function saveRegisteredMaterials(newMaterials) {
+  try {
+    chrome.storage.local.get({ meshRegisteredMaterials: [] }, (data) => {
+      const existing = Array.isArray(data.meshRegisteredMaterials) ? data.meshRegisteredMaterials : [];
+      const map = new Map();
+      for (const m of [...newMaterials, ...existing]) {
+        if (m && m.uuid) map.set(m.uuid, m);
+      }
+      const merged = Array.from(map.values());
+      chrome.storage.local.set({ meshRegisteredMaterials: merged });
+    });
+  } catch (e) {
+    /* ignore */
+  }
+}
+
 function sendProgress(value) {
   chrome.runtime.sendMessage({ type: 'progress', value: value });
 }
@@ -745,6 +1054,17 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
   sendProgress(100); // Завершающий прогресс
   return results;
 }
+// Слушаем перехваченные материалы из MAIN-мира (material_interceptor.js)
+window.addEventListener('message', (event) => {
+  if (event.source !== window) return;
+  const data = event.data;
+  if (!data || data.source !== 'MESH_MATERIAL_TRACKER') return;
+  if (data.type === 'registered' && Array.isArray(data.materials)) {
+    saveRegisteredMaterials(data.materials);
+    sendLog(`📎 Зарегистрирован материал(ы): ${data.materials.map(m => m.name || m.uuid).join('; ')}`);
+  }
+});
+
 // Listen for messages from popup
 sendLog('Content script loaded on school.mos.ru');
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -828,6 +1148,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ success: true });
     }).catch(error => {
       sendError('Error in addHomeworkForPeriod: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true;
+  } else if (request.action === "addMaterialForPeriod"){
+    addMaterialForPeriod({
+      date_from: request.date_from,
+      date_to: request.date_to,
+      materials: request.materials
+    }).then((summary) => {
+      sendResponse({
+        success: !summary || summary.failCount === 0,
+        result: summary
+      });
+    }).catch(error => {
+      sendError('Error in addMaterialForPeriod: ' + error.message);
       sendResponse({ success: false, error: error.message });
     });
     return true;

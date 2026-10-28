@@ -92,6 +92,13 @@ document.addEventListener('DOMContentLoaded', () => {
   if (hwDateFrom) hwDateFrom.value = firstDayStr;
   if (hwDateTo) hwDateTo.value = todayStr;
 
+  const matDateFrom = document.getElementById('matDateFrom');
+  const matDateTo = document.getElementById('matDateTo');
+  if (matDateFrom) matDateFrom.value = firstDayStr;
+  if (matDateTo) matDateTo.value = todayStr;
+
+  loadRegisteredMaterials();
+
   const updateLessonDateInputs = () => {
     const disabled = !useLessonDateRange.checked;
     lessonDateRange.style.display = disabled ? 'none' : 'flex';
@@ -346,6 +353,114 @@ document.getElementById('addHomeworkBtn').addEventListener('click', () => {
           statusDiv.textContent = 'Таймаут - нет ответа от content script';
         }
       }, 30000);
+    } else {
+      statusDiv.textContent = 'Перейдите в МЭШ.';
+    }
+  });
+});
+
+// --- Материалы (доп. фича) ---
+
+// Загружает зарегистрированные материалы из chrome.storage и рисует галочки
+function loadRegisteredMaterials() {
+  const container = document.getElementById('registeredMaterials');
+  if (!container) return;
+  chrome.storage.local.get({ meshRegisteredMaterials: [] }, (data) => {
+    const materials = Array.isArray(data.meshRegisteredMaterials) ? data.meshRegisteredMaterials : [];
+    container.innerHTML = '';
+    if (materials.length === 0) {
+      const em = document.createElement('em');
+      em.textContent = 'Появятся здесь после регистрации материала на сайте МЭШ.';
+      container.appendChild(em);
+      return;
+    }
+    materials.forEach((m, index) => {
+      const label = document.createElement('label');
+      label.style.display = 'block';
+      label.style.margin = '2px 0';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'registeredMaterialCheckbox';
+      checkbox.dataset.uuid = m.uuid;
+      checkbox.dataset.originalUuid = m.original_uuid || m.uuid;
+      checkbox.dataset.name = m.name || '';
+      checkbox.checked = index === 0; // по умолчанию выбираем первый
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(' ' + (m.name || m.uuid)));
+      container.appendChild(label);
+    });
+  });
+}
+
+document.getElementById('refreshMaterialsBtn').addEventListener('click', () => {
+  loadRegisteredMaterials();
+});
+
+// Кнопка добавления материала на диапазон дат
+document.getElementById('addMaterialBtn').addEventListener('click', () => {
+  const statusDiv = document.getElementById('status');
+  const dateFrom = document.getElementById('matDateFrom').value;
+  const dateTo = document.getElementById('matDateTo').value;
+
+  if (!dateFrom || !dateTo) {
+    statusDiv.textContent = 'Выберите диапазон дат для материала.';
+    return;
+  }
+
+  if (dateFrom > dateTo) {
+    statusDiv.textContent = 'Дата "С" не может быть позже даты "По".';
+    return;
+  }
+
+  // Собираем выбранные материалы (доп. фича). Если ничего не выбрано —
+  // content.js использует материал по умолчанию.
+  const selected = [];
+  document.querySelectorAll('.registeredMaterialCheckbox').forEach((cb) => {
+    if (cb.checked) {
+      selected.push({ uuid: cb.dataset.uuid, original_uuid: cb.dataset.originalUuid, name: cb.dataset.name });
+    }
+  });
+
+  const formatDate = (dateStr) => {
+    const [y, m, d] = dateStr.split('-');
+    return `${d}.${m}.${y}`;
+  };
+
+  statusDiv.textContent = 'Добавление материала...';
+  console.log('Sending addMaterialForPeriod action...');
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0] && tabs[0].url.includes('school.mos.ru')) {
+      let responded = false;
+      chrome.tabs.sendMessage(tabs[0].id, {
+        action: 'addMaterialForPeriod',
+        date_from: formatDate(dateFrom),
+        date_to: formatDate(dateTo),
+        materials: selected
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('Runtime error:', chrome.runtime.lastError);
+          statusDiv.textContent = 'Ошибка: ' + chrome.runtime.lastError.message + '. Перезагрузите страницу.';
+          return;
+        }
+        responded = true;
+        console.log('Response received:', response);
+        const summary = response && response.result;
+        if (response && response.success) {
+          statusDiv.textContent = summary
+            ? `Готово! Успешно: ${summary.successCount}, добавлено материалов: ${summary.addedCount}`
+            : 'Материал успешно добавлен на диапазон!';
+        } else {
+          statusDiv.textContent = summary
+            ? `Ошибки: ${summary.failCount}. Первая: ${summary.firstError || 'см. лог'}`
+            : 'Ошибка: ' + (response?.error || 'Нет ответа');
+        }
+      });
+      setTimeout(() => {
+        if (!responded) {
+          statusDiv.textContent = 'Таймаут - нет ответа от content script';
+        }
+      }, 60000);
     } else {
       statusDiv.textContent = 'Перейдите в МЭШ.';
     }
