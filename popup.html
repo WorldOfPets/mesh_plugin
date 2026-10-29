@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>МЫШЬ 2.1</title>
+  <title>МЫШЬ 2.2</title>
   <style>
     body { width: 350px; padding: 10px; }
     button { width: 100%; padding: 10px; margin: 10px 0; }
@@ -11,8 +11,12 @@
   </style>
 </head>
 <body>
-  <h1>МЫШЬ 2.1</h1>
+  <div style="display: flex; justify-content: space-between; align-items: center;">
+    <h1 style="margin: 0;">МЫШЬ 2.3</h1>
+    <button id="refreshTokenBtn" title="Обновить токен сессии (если слетела авторизация)" style="width: auto; padding: 4px 8px; margin: 0; font-size: 12px;">⟳ Токен</button>
+  </div>
   <span>Поддержать автора - кошелек ЮMoney: 4100 1195 1823 6176</span>
+  <div id="tokenStatus" style="font-size: 11px; color: #555; margin: 2px 0;"></div>
   <button id="startBtn">Без ДЗ на все даты</button>
   <button id="syncKTP">Синхронизация KTP</button>
   <div style="margin: 10px 0px;">

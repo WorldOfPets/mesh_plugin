@@ -6,6 +6,11 @@ const CONFIG = {
     AID: 'aid',
     SUBSYSTEM_ID: 'subsystem_id'
   },
+  STORAGE: {
+    AUTH_CONTEXT: 'meshAuthContext',
+    LAST_REFRESH: 'meshLastTokenRefresh'
+  },
+  TOKEN_SOFT_TTL: 5 * 60 * 1000, // 5 минут — после этого пробуем тихо обновить токен
   DELAYS: {
     ABSENCE: 100, // мс между запросами "Без ДЗ"
     KTP: 1000     // мс между действиями КТП
@@ -26,29 +31,568 @@ function sendError(message) {
   chrome.runtime.sendMessage({ type: 'error', message: message });
 }
 
-const createHeaders = () => ({
-  'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
-  'x-mes-subsystem': 'journalw',
-  'Content-Type': 'application/json',
-  'aid': getCookie(CONFIG.COOKIES.AID),
-  'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
-  'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
-  'origin': CONFIG.API_BASE.replace('/api', ''),
-  'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
-});
+// --- Кэш авторизационных данных (chrome.storage + web storage fallback) ---
+// Куки aupd_token/profile_id/aid/subsystem_id иногда недоступны при чтении
+// document.cookie (или "мигают"), что приводит к запросам с пустыми заголовками
+// и ошибкам 500/401. Кэшируем последние валидные значения и используем их как
+// фолбэк, а также храним время последнего обновления токена.
+let _authCache = null;
+let _authCacheLoaded = false;
+let _lastCookieStoreSync = 0; // троттлинг чтения cookie store через chrome.cookies
+const COOKIE_STORE_SYNC_INTERVAL = 2000; // мс
+
+/**
+ * Читает значение из localStorage/sessionStorage (значения могут быть
+ * обёрнуты в кавычки как JSON-строки).
+ */
+function readWebStorageValue(key) {
+  const stores = [];
+  try { stores.push(window.localStorage); } catch (e) { /* ignore */ }
+  try { stores.push(window.sessionStorage); } catch (e) { /* ignore */ }
+  for (const store of stores) {
+    if (!store) continue;
+    try {
+      const raw = store.getItem(key);
+      if (raw != null && raw !== '' && raw !== 'null' && raw !== 'undefined') {
+        return raw.replace(/^"|"$/g, '');
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return null;
+}
+
+function loadAuthCache() {
+  return new Promise((resolve) => {
+    if (_authCacheLoaded) {
+      resolve(_authCache);
+      return;
+    }
+    try {
+      chrome.storage.local.get({ [CONFIG.STORAGE.AUTH_CONTEXT]: null }, (data) => {
+        const stored = data[CONFIG.STORAGE.AUTH_CONTEXT];
+        if (stored && typeof stored === 'object') {
+          _authCache = stored;
+        }
+        _authCacheLoaded = true;
+        resolve(_authCache);
+      });
+    } catch (e) {
+      _authCacheLoaded = true;
+      resolve(null);
+    }
+  });
+}
+
+function saveAuthCache(ctx) {
+  if (!ctx) return;
+  _authCache = Object.assign({}, _authCache, ctx);
+  _authCacheLoaded = true;
+  try {
+    chrome.storage.local.set({ [CONFIG.STORAGE.AUTH_CONTEXT]: _authCache });
+  } catch (e) { /* ignore */ }
+}
+
+/**
+ * Запрашивает авторизационные куки из cookie store браузера через service worker
+ * (chrome.cookies). Это надёжнее, чем document.cookie, если кука httpOnly или
+ * почему-то не видна из контент-скрипта.
+ * @returns {Promise<{token?:string, profileId?:string, aid?:string, subsystemId?:string}>}
+ */
+function getCookieStoreAuthContext() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ action: 'getAuthCookies' }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.success) {
+          resolve({});
+          return;
+        }
+        resolve({
+          token: resp.token || undefined,
+          profileId: resp.profileId || undefined,
+          aid: resp.aid || undefined,
+          subsystemId: resp.subsystemId || undefined
+        });
+      });
+    } catch (e) {
+      resolve({});
+    }
+  });
+}
+
+/**
+ * Просит service worker записать набор авторизационных кук в cookie store
+ * и вернуть итоговый контекст. Так «обновлённые» значения реально попадают в
+ * куки (access-токен может быть httpOnly/поставлен не туда, где мы его искали).
+ * @param {{token?:string, profileId?:string, aid?:string, subsystemId?:string}} ctx
+ * @returns {Promise<{success:boolean, written?:number, total?:number, cookies?:object, error?:string}>}
+ */
+function persistAuthCookies(ctx) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ action: 'setAuthCookies', context: ctx }, (resp) => {
+        if (chrome.runtime.lastError || !resp) {
+          resolve({ success: false, error: chrome.runtime.lastError ? chrome.runtime.lastError.message : 'no response' });
+          return;
+        }
+        resolve(resp);
+      });
+    } catch (e) {
+      resolve({ success: false, error: e.message });
+    }
+  });
+}
+
+/**
+ * Возвращает актуальный контекст авторизации: приоритет у свежих кук, затем
+ * localStorage/sessionStorage, затем кэш в chrome.storage.local.
+ * @param {boolean} [syncFromCookieStore] - если true, дополнительно читает куки
+ *        через chrome.cookies (набор куки авторизации, а не только токен).
+ * @returns {Promise<{token?:string, profileId?:string, aid?:string, subsystemId?:string, tokenAddedAt?:number}>}
+ */
+async function getAuthContext(syncFromCookieStore = false) {
+  await loadAuthCache();
+
+  let fromStore = {};
+  if (syncFromCookieStore && (Date.now() - _lastCookieStoreSync > COOKIE_STORE_SYNC_INTERVAL)) {
+    _lastCookieStoreSync = Date.now();
+    fromStore = await getCookieStoreAuthContext();
+  }
+
+  const fromCookies = {
+    token: getCookie(CONFIG.COOKIES.TOKEN),
+    profileId: getCookie(CONFIG.COOKIES.PROFILE_ID),
+    aid: getCookie(CONFIG.COOKIES.AID),
+    subsystemId: getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)
+  };
+  const fromWeb = {
+    token: readWebStorageValue('aupd_token'),
+    profileId: readWebStorageValue('profile_id'),
+    aid: readWebStorageValue('aid'),
+    subsystemId: readWebStorageValue('subsystem_id')
+  };
+  const cached = _authCache || {};
+  // tokenOverride имеет наивысший приоритет: это токен, полученный в теле ответа
+  // refresh. Пока действует override, НЕ доверяем возможно устаревшей куке/кэшу.
+  const overrideActive = cached.tokenOverride && cached.overrideExpiresAt && Date.now() < cached.overrideExpiresAt;
+  const overrideToken = overrideActive ? cached.tokenOverride : null;
+  const token = overrideToken || fromCookies.token || fromStore.token || fromWeb.token || cached.token || null;
+  const merged = {
+    token: token,
+    profileId: fromCookies.profileId || fromStore.profileId || fromWeb.profileId || cached.profileId || null,
+    aid: fromCookies.aid || fromStore.aid || fromWeb.aid || cached.aid || null,
+    subsystemId: fromCookies.subsystemId || fromStore.subsystemId || fromWeb.subsystemId || cached.subsystemId || null,
+    tokenAddedAt: (token && token !== cached.token) ? Date.now() : (cached.tokenAddedAt || null),
+    tokenOverride: overrideToken,
+    overrideExpiresAt: overrideActive ? cached.overrideExpiresAt : null
+  };
+  if (merged.token !== cached.token ||
+      merged.profileId !== cached.profileId ||
+      merged.aid !== cached.aid ||
+      merged.subsystemId !== cached.subsystemId) {
+    saveAuthCache(merged);
+  }
+  return merged;
+}
+
+function createHeadersFromContext(ctx) {
+  const base = CONFIG.API_BASE.replace('/api', '');
+  const headers = {
+    'x-mes-subsystem': 'journalw',
+    'Content-Type': 'application/json',
+    'origin': base,
+    'referer': `${base}/`
+  };
+  // Не отправляем заголовки со значением null — сервер на это отвечает 500.
+  if (ctx.token) headers['Authorization'] = `Bearer ${ctx.token}`;
+  if (ctx.aid) headers['aid'] = ctx.aid;
+  if (ctx.profileId) headers['profile-id'] = ctx.profileId;
+  if (ctx.subsystemId) headers['x-mes-hostid'] = ctx.subsystemId;
+  return headers;
+}
+
+async function getProfileId() {
+  const ctx = await getAuthContext();
+  return ctx.profileId;
+}
+
+/**
+ * Пытается получить academic_year_id (aid) из других источников:
+ *  1) полезная нагрузка JWT-токена (поля aid/academic_year_id/...)
+ *  2) localStorage/sessionStorage (ключи aid/academic_year_id/academicYearId)
+ * @param {string} token
+ * @returns {string|null}
+ */
+function deriveAid({ token, webStorage } = {}) {
+  // 1) из JWT
+  try {
+    if (token) {
+      const parts = String(token).split('.');
+      if (parts.length === 3) {
+        const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        const payload = JSON.parse(atob(b64));
+        const candidates = [
+          payload.aid, payload.academic_year_id, payload.academicYearId,
+          payload.ay_id, payload.academicYear, payload.year_id,
+          payload.data && payload.data.aid,
+          payload.context && payload.context.aid,
+          payload.user && (payload.user.aid || payload.user.academic_year_id)
+        ];
+        for (const c of candidates) {
+          if (c != null && c !== '' && c !== 'null') return String(c);
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  // 2) из web storage (точные ключи + поиск по ключам, содержащим academic/aid)
+  if (webStorage) {
+    const keys = ['aid', 'academic_year_id', 'academicYearId', 'academicYearID', 'ay_id'];
+    for (const k of keys) {
+      const v = readWebStorageValue(k);
+      if (v && /^\d+$/.test(v)) return v;
+    }
+
+    const stores = [];
+    try { stores.push(window.localStorage); } catch (e) { /* ignore */ }
+    try { stores.push(window.sessionStorage); } catch (e) { /* ignore */ }
+    for (const store of stores) {
+      if (!store) continue;
+      try {
+        for (let i = 0; i < store.length; i++) {
+          const key = store.key(i);
+          if (!key) continue;
+          if (!/academic|ay_|_aid$|^aid$|year/i.test(key)) continue;
+          const raw = store.getItem(key);
+          if (!raw) continue;
+          // Прямое число или JSON вида {"id": 123}
+          if (/^\d+$/.test(raw)) return raw;
+          try {
+            const parsed = JSON.parse(raw);
+            const id = parsed && (parsed.id || parsed.aid || parsed.academic_year_id);
+            if (id != null && /^\d+$/.test(String(id))) return String(id);
+          } catch (e) { /* ignore */ }
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+  return null;
+}
+
+let _aidResolution = null;
+
+/**
+ * Определяет aid для текущего контекста:
+ *  - из куки/web storage/JWT ([`getAuthContext`](content.js:1) уже пробует куки+web storage);
+ *  - если нет — из ответа teacher profile API.
+ * Результат кэшируется.
+ * @returns {Promise<string|null>}
+ */
+async function getAid() {
+  const ctx = await getAuthContext(true);
+  if (ctx.aid) return ctx.aid;
+
+  const fromToken = deriveAid({ token: ctx.token, webStorage: true });
+  if (fromToken) {
+    saveAuthCache(Object.assign({}, ctx, { aid: fromToken }));
+    sendLog(`🆔 aid определён из токена/хранилища: ${fromToken}`);
+    return fromToken;
+  }
+
+  if (!_aidResolution) {
+    _aidResolution = (async () => {
+      try {
+        const profileId = ctx.profileId;
+        if (!profileId) return null;
+        const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/teacher_profiles/${profileId}?with_assigned_groups=true&with_replacement_groups=true`;
+        const response = await apiFetch(url, { method: 'GET' });
+        if (!response.ok) return null;
+        const data = await response.json();
+        const fromProfile =
+          data.academic_year_id || data.current_academic_year_id ||
+          (data.academic_year && (data.academic_year.id || data.academic_year)) ||
+          (Array.isArray(data.academic_years) && data.academic_years[0] &&
+            (data.academic_years[0].id || data.academic_years[0]));
+        if (fromProfile) {
+          const aid = String(fromProfile);
+          const fresh = await getAuthContext(false);
+          saveAuthCache(Object.assign({}, fresh, { aid }));
+          sendLog(`🆔 aid определён из профиля: ${aid}`);
+          return aid;
+        }
+        sendLog('⚠️ Не удалось определить aid из профиля учителя.');
+        return null;
+      } catch (e) {
+        sendLog('⚠️ Ошибка определения aid из профиля: ' + e.message);
+        return null;
+      }
+    })();
+  }
+  return await _aidResolution;
+}
+
+/**
+ * Обновляет токен сессии через first-party эндпоинт school.mos.ru.
+ * @returns {Promise<{success:boolean, status?:number, message?:string, error?:string}>}
+ */
+async function doTokenRefresh() {
+  const url = 'https://school.mos.ru/v3/token/refresh';
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'accept': '*/*',
+      'content-type': 'application/x-www-form-urlencoded',
+      'origin': 'https://school.mos.ru',
+      'referer': 'https://school.mos.ru/'
+    },
+    body: null,
+    credentials: 'include'
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    return {
+      success: false,
+      status: response.status,
+      error: `${response.status} ${response.statusText} ${errorText}`.trim()
+    };
+  }
+
+  // Иногда новый токен приходит в теле ответа, а не (только) в куке —
+  // пробуем достать его оттуда (а также aid/subsystem, если они там есть).
+  let fromBody = {};
+  try {
+    const raw = await response.clone().text();
+    if (raw) {
+      let parsed = null;
+      try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+      // Возможные обёртки
+      const scopes = [parsed,
+        parsed && parsed.data,
+        parsed && parsed.result,
+        parsed && parsed.data && parsed.data.user,
+        parsed && parsed.user].filter(Boolean);
+      for (const obj of scopes) {
+        const token = obj.token || obj.access_token;
+        if (token) fromBody.token = token;
+        const aid = obj.aid || obj.academic_year_id || obj.academicYearId;
+        if (aid != null && aid !== '') fromBody.aid = String(aid);
+        const sub = obj.subsystem_id || obj.subsystemId || obj['x-mes-hostid'];
+        if (sub != null && sub !== '') fromBody.subsystemId = String(sub);
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  const now = Date.now();
+  const prev = _authCache || {};
+  // После обновления токена перечитываем весь набор авторизационных кук
+  // (profile_id/aid/subsystem_id тоже могли обновиться).
+  const fromStore = {};
+  try {
+    const store = await getCookieStoreAuthContext();
+    Object.assign(fromStore, store);
+  } catch (e) { /* ignore */ }
+  const cookieToken = getCookie(CONFIG.COOKIES.TOKEN) || fromStore.token || readWebStorageValue('aupd_token') || prev.token || null;
+  const effectiveToken = fromBody.token || cookieToken;
+  const resolvedAid = fromBody.aid || getCookie(CONFIG.COOKIES.AID) || fromStore.aid ||
+    readWebStorageValue('aid') || prev.aid || deriveAid({ token: effectiveToken, webStorage: true }) || null;
+  const ctx = {
+    token: effectiveToken,
+    profileId: getCookie(CONFIG.COOKIES.PROFILE_ID) || fromStore.profileId || readWebStorageValue('profile_id') || prev.profileId || null,
+    aid: resolvedAid,
+    subsystemId: fromBody.subsystemId || getCookie(CONFIG.COOKIES.SUBSYSTEM_ID) || fromStore.subsystemId || readWebStorageValue('subsystem_id') || prev.subsystemId || null,
+    tokenAddedAt: now
+  };
+  // Если refresh вернул токен в теле, а кука ещё не обновилась — держим токен
+  // из тела как override на несколько минут, чтобы не отправить устаревший
+  // токен из куки (это и давало 500).
+  if (fromBody.token && fromBody.token !== getCookie(CONFIG.COOKIES.TOKEN) && fromBody.token !== fromStore.token) {
+    ctx.tokenOverride = fromBody.token;
+    ctx.overrideExpiresAt = now + 10 * 60 * 1000;
+  } else {
+    ctx.tokenOverride = null;
+    ctx.overrideExpiresAt = null;
+  }
+  saveAuthCache(ctx);
+  // Токен сменился — сбрасываем кэш определения aid, чтобы он перерезолвился.
+  _aidResolution = null;
+  try {
+    chrome.storage.local.set({ [CONFIG.STORAGE.LAST_REFRESH]: now });
+  } catch (e) { /* ignore */ }
+
+  // Активно записываем найденные значения в куки через service worker, чтобы
+  // даже httpOnly/кривопутные куки были приведены к рабочему состоянию.
+  try {
+    const persisted = await persistAuthCookies({
+      token: ctx.token,
+      profileId: ctx.profileId,
+      aid: ctx.aid,
+      subsystemId: ctx.subsystemId
+    });
+    if (persisted && persisted.success) {
+      sendLog(`🍪 Куки записаны: ${persisted.written}/${persisted.total}`);
+      // После записи обновляем кэш фактическими значениями из cookie store.
+      if (persisted.cookies) {
+        const fresh = {
+          token: persisted.cookies.token || ctx.token,
+          profileId: persisted.cookies.profileId || ctx.profileId,
+          aid: persisted.cookies.aid || ctx.aid,
+          subsystemId: persisted.cookies.subsystemId || ctx.subsystemId,
+          tokenAddedAt: now,
+          tokenOverride: ctx.tokenOverride,
+          overrideExpiresAt: ctx.overrideExpiresAt
+        };
+        saveAuthCache(fresh);
+      }
+    } else {
+      sendLog('⚠️ Не удалось записать куки: ' + ((persisted && persisted.error) || 'неизвестная ошибка'));
+    }
+  } catch (e) {
+    sendLog('⚠️ Ошибка записи кук: ' + e.message);
+  }
+
+  // Диагностика: откуда взяли токен и когда он истекает (по JWT exp).
+  const source = fromBody.token ? 'тело ответа' : (getCookie(CONFIG.COOKIES.TOKEN) ? 'кука aupd_token' : (fromStore.token ? 'cookie store' : 'кэш'));
+  let expInfo = '';
+  try {
+    const parts = String(ctx.token).split('.');
+    if (parts.length === 3) {
+      const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      if (payload && payload.exp) {
+        const expDate = new Date(payload.exp * 1000);
+        const minsLeft = Math.round((expDate.getTime() - Date.now()) / 60000);
+        expInfo = `, действует ещё ~${minsLeft} мин`;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  sendLog(`🔎 Токен (${source})${expInfo}`);
+
+  const missing = !ctx.token || !ctx.profileId || !ctx.aid || !ctx.subsystemId;
+  return {
+    success: true,
+    status: response.status,
+    message: 'Токен обновлён' + (missing ? ' (часть кук не найдена)' : '')
+  };
+}
+
+/**
+ * Публичная обёртка обновления токена (логирует в popup).
+ */
+async function refreshToken() {
+  try {
+    const result = await doTokenRefresh();
+    if (result.success) {
+      sendLog('🔑 Токен успешно обновлён');
+    } else {
+      sendError(`❌ Не удалось обновить токен: ${result.status || ''} ${result.error || ''}`.trim());
+    }
+    return result;
+  } catch (e) {
+    sendError(`❌ Ошибка запроса обновления токена: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Универсальная обёртка над fetch для запросов к API МЭШ:
+ *  - подставляет актуальные заголовки авторизации (из кук/кэша);
+ *  - при истечении мягкого TTL тихо обновляет токен перед запросом;
+ *  - при ответе 401/403/500 один раз обновляет токен и повторяет запрос.
+ * @param {string} url
+ * @param {Object} [options] - { method, body, mode ('journalw'|'teacherspow'), credentials }
+ * @returns {Promise<Response>}
+ */
+async function apiFetch(url, options = {}) {
+  const mode = options.mode || 'journalw';
+  const init = {
+    method: options.method || 'GET',
+    credentials: options.credentials || 'include'
+  };
+  if (options.body !== undefined) {
+    init.body = options.body;
+  }
+
+  const buildHeaders = async (syncFromStore) => {
+    const ctx = await getAuthContext(syncFromStore);
+    const headers = createHeadersFromContext(ctx);
+    if (mode === 'teacherspow') {
+      headers['x-mes-subsystem'] = 'teacherspow';
+    }
+    return headers;
+  };
+
+  // Мягкое проактивное обновление токена (с перечитыванием набора кук авторизации).
+  const ctxBefore = await getAuthContext(true);
+  if (ctxBefore.tokenAddedAt && (Date.now() - ctxBefore.tokenAddedAt > CONFIG.TOKEN_SOFT_TTL)) {
+    await doTokenRefresh().catch(() => { /* ignore */ });
+  }
+
+  init.headers = await buildHeaders(false);
+  let response = await fetch(url, init);
+
+  if (response.status === 401 || response.status === 403 || response.status === 500) {
+    const refreshed = await doTokenRefresh().catch(() => ({ success: false }));
+    if (refreshed && refreshed.success) {
+      // После refresh берём куки напрямую из cookie store (в обход троттлинга),
+      // чтобы повторить запрос уже с обновлённым токеном.
+      _lastCookieStoreSync = Date.now();
+      init.headers = await buildHeaders(true);
+      response = await fetch(url, init);
+    }
+  }
+
+  // Диагностика: какой именно запрос упал и что ответил сервер.
+  if (!response.ok && response.status >= 400) {
+    logFailedResponse(init.method, url, response, init.headers);
+  }
+  return response;
+}
+
+/**
+ * Краткая сводка авторизационных заголовков (без полного токена).
+ */
+function summarizeAuthHeaders(headers) {
+  try {
+    const h = headers || {};
+    const auth = h['Authorization'] || '';
+    const tokenLen = auth ? auth.replace('Bearer ', '').length : 0;
+    return `aid=${h['aid'] ?? '—'}, profile-id=${h['profile-id'] ?? '—'}, hostid=${h['x-mes-hostid'] ?? '—'}, subsystem=${h['x-mes-subsystem'] ?? '—'}, token=${tokenLen ? tokenLen + ' симв.' : 'НЕТ'}`;
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * Логирует в popup метод, URL и тело ответа для ошибочного запроса.
+ * Не потребляет исходный ответ (использует clone).
+ */
+function logFailedResponse(method, url, response, headers) {
+  try {
+    const shortUrl = String(url).replace(CONFIG.API_BASE, '');
+    const headerInfo = summarizeAuthHeaders(headers);
+    response.clone().text().then((text) => {
+      const snippet = (text || '').slice(0, 400);
+      const msg = `❌ ${method} ${shortUrl} → HTTP ${response.status} ${response.statusText}` + (snippet ? ` — ${snippet}` : '') + `\n   ↳ ${headerInfo}`;
+      sendLog(msg);
+      console.warn('[МЫШЬ]', msg);
+    }).catch(() => {
+      const msg = `❌ ${method} ${shortUrl} → HTTP ${response.status} ${response.statusText}\n   ↳ ${headerInfo}`;
+      sendLog(msg);
+      console.warn('[МЫШЬ]', msg);
+    });
+  } catch (e) { /* ignore */ }
+}
 
 async function setHomeworkAbsences(groupId, absenceDate) {
   const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/homework_absences`;
+  const profileId = await getProfileId();
   const payload = {
     group_id: groupId,
     date: absenceDate,
-    created_by: getCookie(CONFIG.COOKIES.PROFILE_ID).toString()
+    created_by: profileId ? profileId.toString() : null
   };
 
   try {
-    const response = await fetch(url, {
+    const response = await apiFetch(url, {
       method: 'POST',
-      headers: createHeaders(),
       body: JSON.stringify(payload)
     });
     if (response.ok) {
@@ -65,16 +609,28 @@ async function setHomeworkAbsences(groupId, absenceDate) {
 }
 
 async function getGroups() {
-  
-  const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/teacher_profiles/${getCookie(CONFIG.COOKIES.PROFILE_ID)}?with_assigned_groups=true&with_replacement_groups=true`;
+  const profileId = await getProfileId();
+  const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/teacher_profiles/${profileId}?with_assigned_groups=true&with_replacement_groups=true`;
   try {
-    const response = await fetch(url, { 
-      method: 'GET',
-      headers: createHeaders(),
-      credentials: 'include'
-    });
+    const response = await apiFetch(url, { method: 'GET' });
     if (response.ok) {
       const data = await response.json();
+
+      // Попутно кэшируем aid (academic_year_id) из профиля, если кука отсутствует.
+      const fromProfile =
+        data.academic_year_id || data.current_academic_year_id ||
+        (data.academic_year && (data.academic_year.id || data.academic_year)) ||
+        (Array.isArray(data.academic_years) && data.academic_years[0] &&
+          (data.academic_years[0].id || data.academic_years[0]));
+      if (fromProfile) {
+        const aid = String(fromProfile);
+        const ctx = await getAuthContext(false);
+        if (ctx.aid !== aid) {
+          saveAuthCache(Object.assign({}, ctx, { aid }));
+          sendLog(`🆔 aid закэширован из профиля: ${aid}`);
+        }
+      }
+
       return data.assigned_group_ids || [];
     } else {
       sendError('Failed to get groups');
@@ -130,7 +686,8 @@ function getDaysInMonth(year, month) {
 }
 
 async function main() {
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const auth = await getAuthContext(true);
+  if (!auth.token || !auth.profileId) {
     sendError('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
@@ -183,10 +740,7 @@ async function calendarPlans(journal, finistOrRecalc = 'finish') {
   const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/calendar_plans/${journal}/${finistOrRecalc}?ignore_IA=true`;
   
   try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: createHeaders(),
-    });
+    const response = await apiFetch(url, { method: 'POST' });
     
     sendLog('Calendar plans response: ' + response.status);
     return response;
@@ -202,16 +756,18 @@ async function calendarPlans(journal, finistOrRecalc = 'finish') {
  * @returns {Promise<Array<number>>} - Массив ID календарей
  */
 async function getAcademicYear(groups) {
+  if (!Array.isArray(groups) || groups.length === 0) {
+    sendError('❌ Не удалось получить список групп (проверьте авторизацию/токен).');
+    throw new Error('Нет доступных групп (пустой список). Возможно, токен ещё не применён — нажмите «⟳ Токен» и перезагрузите страницу.');
+  }
   // Преобразуем массив в строку "1,2,3"
   const groupsStr = groups.map(String).join(',');
+  const aid = await getAid();
   
-  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/calendar_plans?academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&group_ids=${groupsStr}`;
+  const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/calendar_plans?academic_year_id=${aid}&group_ids=${groupsStr}`;
   
   try {
-    const response = await fetch(url, { 
-      method: 'GET',
-      headers: createHeaders(),
-    });
+    const response = await apiFetch(url, { method: 'GET' });
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -230,7 +786,8 @@ async function getAcademicYear(groups) {
 }
 
 async function syncKTP() {
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const auth = await getAuthContext(true);
+  if (!auth.token || !auth.profileId) {
     sendError('Перезайдите в учетную запись МЭШ.');
   }
   sendLog('Starting to set homework absences...');
@@ -262,23 +819,29 @@ async function syncKTP() {
 }
 
 async function selectGroups() {
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const auth = await getAuthContext(true);
+  if (!auth.token || !auth.profileId) {
     sendError('Перезайдите в учетную запись МЭШ.');
   }
   const groups = await getGroups();
+  if (!Array.isArray(groups) || groups.length === 0) {
+    sendError('❌ Не удалось получить список групп (проверьте авторизацию/токен).');
+    throw new Error('Нет доступных групп (пустой список). Возможно, токен ещё не применён — нажмите «⟳ Токен» и перезагрузите страницу.');
+  }
   const groupsStr = groups.map(String).join(',');
+  // aid не всегда лежит в куке — резолвим его (токен/профиль).
+  const aid = auth.aid || await getAid();
+  if (!aid) {
+    throw new Error('Не удалось определить academic_year_id (aid). Перезайдите в МЭШ и нажмите «⟳ Токен».');
+  }
   const url = CONFIG.API_BASE + '/profeducation/plan/teacher/v1/groups' +
-    '?academic_year_id=' + getCookie(CONFIG.COOKIES.AID) +
+    '?academic_year_id=' + aid +
     '&group_ids=' + groupsStr +
     '&with_periods_schedule_id=true' +
     '&with_parallel_curriculum_id=true' +
     '&with_lesson_plans_info=true';
   try {
-    const response = await fetch(url, { 
-      method: 'GET',
-      headers: createHeaders(), 
-      credentials: 'include'
-    });
+    const response = await apiFetch(url, { method: 'GET' });
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -310,7 +873,8 @@ function formatDateForApi(dateString) {
 
 async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_ids, use_lesson_date_range = false, lesson_date_from = '', lesson_date_to = '') {
   try {
-    if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+    const auth = await getAuthContext(true);
+    if (!auth.token || !auth.profileId) {
       sendError('Перезайдите в учетную запись МЭШ.');
     }
     const period = getCurrentAcademicPeriod();
@@ -322,11 +886,7 @@ async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_i
       
       `created_at_from=${dateFrom}&` +
       `created_at_to=${dateTo}&` 
-    const response = await fetch(urlmarks, {
-      method: 'GET',
-      headers: createHeaders(),
-      credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
-    });
+    const response = await apiFetch(urlmarks, { method: 'GET' });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
@@ -362,6 +922,8 @@ async function setDefaultForMarks(group_id, subject_id, classlevel_id, student_i
 }
 
 async function getLessons(group_id, subject_id, options = {}){
+  const auth = await getAuthContext();
+  const aid = auth.aid || await getAid();
   const period = getCurrentAcademicPeriod();
   let dateFrom = period ? `${period.year}-${period.startMonth.toString().padStart(2, '0')}-${period.startDay.toString().padStart(2, '0')}` : null;
   let dateTo = period ? `${period.year}-${period.endMonth.toString().padStart(2, '0')}-${period.endDay.toString().padStart(2, '0')}` : null;
@@ -381,10 +943,10 @@ async function getLessons(group_id, subject_id, options = {}){
   }
 
   const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/schedule_items?` +
-      `academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&` +
+      `academic_year_id=${aid}&` +
       `group_ids=${group_id}&` +
       `subject_id=${subject_id}&` +
-      `teacher_id=${getCookie(CONFIG.COOKIES.PROFILE_ID)}&` +
+      `teacher_id=${auth.profileId}&` +
       `from=${dateFrom}&` +
       `to=${dateTo}&` +
       `with_group_class_subject_info=true&` +
@@ -393,11 +955,7 @@ async function getLessons(group_id, subject_id, options = {}){
       `with_rooms_info=true&` +
       `with_availability_info=true&`;
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: createHeaders(),
-
-  });
+  const response = await apiFetch(url, { method: 'GET' });
   if (!response.ok) {
     console.error(`❌ Error getting lessons: HTTP ${response.status} ${response.statusText}`);
     return [];
@@ -421,11 +979,7 @@ async function getLessons(group_id, subject_id, options = {}){
 async function getAverageMarks(group_id, subject_id, student_ids, defaultMark = 0) {
   try{
     const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/average_marks_year?group_ids=${group_id}&student_profile_ids=${student_ids}&subject_id=${subject_id}`;
-    const response = await fetch(url, {
-        method: 'GET',
-        headers: createHeaders(),
-        credentials: 'include' // Важно: отправляет cookies сессии (аналог requests с сессией)
-      });
+    const response = await apiFetch(url, { method: 'GET' });
     const allStudentIds = student_ids
         .split(',')
         .map(id => id.trim())
@@ -484,20 +1038,10 @@ function randomizeMark(mark) {
  */
 async function addHomework({ group_id, subject_id, teacher_id, student_ids, description, duration, date_assigned_on, date_prepared_for }) {
   const url = `${CONFIG.API_BASE}/profeducation/core/teacher/v1/homeworks`;
-  
-  const headers = {
-    'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
-    'x-mes-subsystem': 'teacherspow',  // Для ДЗ нужна подсистема teacherspow
-    'Content-Type': 'application/json',
-    'aid': getCookie(CONFIG.COOKIES.AID),
-    'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
-    'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
-    'origin': CONFIG.API_BASE.replace('/api', ''),
-    'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
-  };
 
-  // Если teacher_id не передан (null), берём из куки profile_id
-  const effectiveTeacherId = teacher_id || getCookie(CONFIG.COOKIES.PROFILE_ID);
+  // Если teacher_id не передан (null), берём из кэша/куки profile_id
+  const auth = await getAuthContext();
+  const effectiveTeacherId = teacher_id || auth.profileId;
 
   const payload = {
     group_id: Number(group_id),
@@ -520,9 +1064,9 @@ async function addHomework({ group_id, subject_id, teacher_id, student_ids, desc
 
   try {
     sendLog(`📝 Добавление ДЗ: группа=${group_id}, предмет=${subject_id}, дата=${date_assigned_on}`);
-    const response = await fetch(url, {
+    const response = await apiFetch(url, {
       method: 'POST',
-      headers: headers,
+      mode: 'teacherspow',
       body: JSON.stringify(payload)
     });
 
@@ -549,7 +1093,8 @@ async function addHomework({ group_id, subject_id, teacher_id, student_ids, desc
  * @param {string} params.date_to - Конец диапазона (ДД.ММ.ГГГГ)
  */
 async function addHomeworkForPeriod({ description, date_from, date_to }) {
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const authForPeriod = await getAuthContext();
+  if (!authForPeriod.token || !authForPeriod.profileId || !authForPeriod.aid || !authForPeriod.subsystemId) {
     sendError('Перезайдите в учетную запись МЭШ.');
     return;
   }
@@ -578,7 +1123,7 @@ async function addHomeworkForPeriod({ description, date_from, date_to }) {
     }
   }
 
-  const teacher_id = getCookie(CONFIG.COOKIES.PROFILE_ID);
+  const teacher_id = authForPeriod.profileId;
   const DURATION = 15; // фиксированная длительность 15 минут
 
   // Парсим date_from и date_to (формат ДД.ММ.ГГГГ)
@@ -674,14 +1219,16 @@ const DEFAULT_MATERIAL = {
  * @returns {Promise<Array<Object>>} - Массив занятий
  */
 async function getLessonsWithStructure({ group_id, subject_id, date_from, date_to }) {
+  const auth = await getAuthContext();
+  const aid = auth.aid || await getAid();
   const from = formatDateForApi(date_from.split('.').reverse().join('-'));
   const to = formatDateForApi(date_to.split('.').reverse().join('-'));
 
   const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/schedule_items?` +
-    `academic_year_id=${getCookie(CONFIG.COOKIES.AID)}&` +
+    `academic_year_id=${aid}&` +
     `group_ids=${group_id}&` +
     `subject_id=${subject_id}&` +
-    `teacher_id=${getCookie(CONFIG.COOKIES.PROFILE_ID)}&` +
+    `teacher_id=${auth.profileId}&` +
     `from=${from}&` +
     `to=${to}&` +
     `with_group_class_subject_info=true&` +
@@ -691,11 +1238,7 @@ async function getLessonsWithStructure({ group_id, subject_id, date_from, date_t
     `with_availability_info=true&`;
 
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: createHeaders(),
-      credentials: 'include'
-    });
+    const response = await apiFetch(url, { method: 'GET' });
     if (!response.ok) {
       sendError(`❌ Не удалось получить занятия: HTTP ${response.status} ${response.statusText}`);
       return [];
@@ -719,28 +1262,12 @@ async function getLessonsWithStructure({ group_id, subject_id, date_from, date_t
 }
 
 /**
- * Хэдеры для работы с планом занятий (подсистема teacherspow).
- */
-function createTeacherspowHeaders() {
-  return {
-    'Authorization': `Bearer ${getCookie(CONFIG.COOKIES.TOKEN)}`,
-    'x-mes-subsystem': 'teacherspow',
-    'Content-Type': 'application/json',
-    'aid': getCookie(CONFIG.COOKIES.AID),
-    'profile-id': getCookie(CONFIG.COOKIES.PROFILE_ID),
-    'x-mes-hostid': getCookie(CONFIG.COOKIES.SUBSYSTEM_ID),
-    'origin': CONFIG.API_BASE.replace('/api', ''),
-    'referer': `${CONFIG.API_BASE.replace('/api', '')}/`
-  };
-}
-
-/**
  * Получает полный объект занятия (GET).
  * @returns {Promise<Object>} - объект занятия как отдаёт сервер
  */
 async function fetchLesson(lessonPlanId, moduleId, topicId, lessonId) {
   const url = `${CONFIG.API_BASE}/profeducation/plan/teacher/v1/lesson_plans/${lessonPlanId}/modules/${moduleId}/topics/${topicId}/lessons/${lessonId}`;
-  const response = await fetch(url, { method: 'GET', headers: createTeacherspowHeaders() });
+  const response = await apiFetch(url, { method: 'GET', mode: 'teacherspow' });
   if (!response.ok) {
     throw new Error(`GET lesson HTTP ${response.status} ${response.statusText}`);
   }
@@ -815,7 +1342,7 @@ async function addMaterialToLesson(lesson, materials) {
 
     const response = await fetch(url, {
       method: 'PUT',
-      headers: createTeacherspowHeaders(),
+      mode: 'teacherspow',
       body: JSON.stringify(payload)
     });
 
@@ -846,7 +1373,8 @@ async function addMaterialToLesson(lesson, materials) {
  *        Материалы для добавления. Если не переданы — используется DEFAULT_MATERIAL.
  */
 async function addMaterialForPeriod({ date_from, date_to, materials }) {
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const auth = await getAuthContext(true);
+  if (!auth.token || !auth.profileId) {
     sendError('Перезайдите в учетную запись МЭШ.');
     return;
   }
@@ -967,7 +1495,8 @@ function sendProgress(value) {
 }
 
 async function setMarks(students_marks, lessons, control_form_id, grade_system_id, course_lesson_topic_id){
-  if (!getCookie(CONFIG.COOKIES.TOKEN) || !getCookie(CONFIG.COOKIES.PROFILE_ID) || !getCookie(CONFIG.COOKIES.AID) || !getCookie(CONFIG.COOKIES.SUBSYSTEM_ID)) {
+  const auth = await getAuthContext(true);
+  if (!auth.token || !auth.profileId) {
     sendError('Перезайдите в учетную запись МЭШ.');
   }
   const results = {
@@ -994,7 +1523,7 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
           point_date: "",
           schedule_lesson_id: lesson,
           student_profile_id: stMark.student_id,
-          teacher_id: getCookie(CONFIG.COOKIES.PROFILE_ID),           // Глобальная константа
+          teacher_id: auth.profileId,           // Глобальная константа
           control_form_id: control_form_id, // Глобальная переменная
           weight: 1,
           theme_frame_integration_id: null,  // Python None → JS null
@@ -1007,11 +1536,9 @@ async function setMarks(students_marks, lessons, control_form_id, grade_system_i
           ],
           grade_system_type: false
         };
-        const response = await fetch(url, {
+        const response = await apiFetch(url, {
           method: 'POST',
-          headers: createHeaders(),
-          body: JSON.stringify(payload), // Аналог json.dumps()
-          credentials: 'include'         // Отправка cookies сессии
+          body: JSON.stringify(payload) // Аналог json.dumps()
         });
         current++;
         sendProgress((current / total) * 100);
@@ -1166,5 +1693,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ success: false, error: error.message });
     });
     return true;
+  } else if (request.action === "refreshToken") {
+    refreshToken().then(result => {
+      sendResponse(result);
+    }).catch(error => {
+      sendError('Error in refreshToken: ' + error.message);
+      sendResponse({ success: false, error: error.message });
+    });
+    return true; // Keep the message channel open for async response
   }
 });

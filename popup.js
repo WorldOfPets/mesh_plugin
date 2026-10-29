@@ -466,3 +466,49 @@ document.getElementById('addMaterialBtn').addEventListener('click', () => {
     }
   });
 });
+
+// --- Обновление токена ---
+// Показывает время последнего успешного обновления токена из chrome.storage
+function loadTokenStatus() {
+  const tokenStatusDiv = document.getElementById('tokenStatus');
+  if (!tokenStatusDiv) return;
+  chrome.storage.local.get({ meshLastTokenRefresh: null }, (data) => {
+    if (data.meshLastTokenRefresh) {
+      const d = new Date(data.meshLastTokenRefresh);
+      tokenStatusDiv.textContent = 'Токен обновлён: ' + d.toLocaleString();
+    } else {
+      tokenStatusDiv.textContent = 'Токен ещё не обновлялся.';
+    }
+  });
+}
+
+document.getElementById('refreshTokenBtn').addEventListener('click', () => {
+  const tokenStatusDiv = document.getElementById('tokenStatus');
+  const btn = document.getElementById('refreshTokenBtn');
+  btn.disabled = true;
+  tokenStatusDiv.textContent = 'Обновление токена...';
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0] && tabs[0].url.includes('school.mos.ru')) {
+      chrome.tabs.sendMessage(tabs[0].id, { action: 'refreshToken' }, (response) => {
+        btn.disabled = false;
+        if (chrome.runtime.lastError) {
+          console.error('Runtime error:', chrome.runtime.lastError);
+          tokenStatusDiv.textContent = 'Ошибка: перезагрузите страницу.';
+          return;
+        }
+        if (response && response.success) {
+          tokenStatusDiv.textContent = response.message || 'Токен обновлён.';
+          loadTokenStatus();
+        } else {
+          tokenStatusDiv.textContent = 'Ошибка: ' + (response?.error || 'нет ответа');
+        }
+      });
+    } else {
+      btn.disabled = false;
+      tokenStatusDiv.textContent = 'Перейдите в МЭШ.';
+    }
+  });
+});
+
+loadTokenStatus();

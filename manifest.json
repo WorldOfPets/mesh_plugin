@@ -1,15 +1,20 @@
 {
   "manifest_version": 3,
   "name": "МЫШЬ",
-  "version": "1.7",
+  "version": "2.4",
   "description": "Extension to mesh",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "cookies"
   ],
   "host_permissions": [
-    "https://school.mos.ru/*"
+    "https://school.mos.ru/*",
+    "https://*.mos.ru/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "МЫШЬ"
